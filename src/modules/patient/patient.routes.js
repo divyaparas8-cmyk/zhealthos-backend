@@ -75,6 +75,7 @@ router.delete('/security/devices/:key', controller.revokeTrustedDevice)
 router.get('/family-profiles', controller.getFamilyProfiles)
 router.get('/achievements', controller.getPatientAchievements)
 router.put('/achievements', controller.updatePatientAchievements)
+router.post('/ai-assistant', controller.askAiRecoveryAssistant)
 
 module.exports = router
 

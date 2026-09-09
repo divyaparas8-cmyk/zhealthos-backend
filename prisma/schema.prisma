@@ -28,7 +28,7 @@ model User {
   passwordHash String
   name         String
   phone        String?
-  avatarUrl    String?      @db.Text
+  avatarUrl    String?      @db.MediumText
   profileData  Json?
   role         Role         @default(CLINIC_ADMIN)
   status       UserStatus   @default(ACTIVE)

@@ -53,6 +53,7 @@ router.put('/appointments/:id', controller.updateAppointment)
 router.delete('/appointments/:id', controller.deleteAppointment)
 
 router.get('/patients', controller.getPatients)
+router.get('/patients/:id', controller.getPatientById)
 router.post('/patients', controller.createPatient)
 router.put('/patients/:id', controller.updatePatient)
 router.delete('/patients/:id', controller.deletePatient)

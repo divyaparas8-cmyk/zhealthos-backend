@@ -32,6 +32,7 @@ router.patch('/waitlist/:id/status', controller.updateWaitlistStatus)
 router.delete('/waitlist/:id', controller.removeFromWaitlist)
 
 router.get('/patients', controller.getPatients)
+router.get('/patients/:id', controller.getPatientById)
 router.post('/patients', controller.createPatient)
 router.put('/patients/:id', controller.updatePatient)
 

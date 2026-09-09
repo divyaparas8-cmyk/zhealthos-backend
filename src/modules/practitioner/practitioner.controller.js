@@ -269,6 +269,37 @@ const removeFromWaitlist = async (req, res, next) => {
   }
 }
 
+// Format patient record by unpacking notes JSON and mapping schema field names
+const formatPatientData = (p) => {
+  if (!p) return null
+  let extra = {}
+  if (p.notes) {
+    try {
+      extra = typeof p.notes === 'string' ? JSON.parse(p.notes) : p.notes
+    } catch (_) {
+      extra = { notes: p.notes }
+    }
+  }
+  const extraObj = (typeof extra === 'object' && extra !== null && !Array.isArray(extra)) ? extra : {}
+
+  return {
+    ...p,
+    ...extraObj,
+    name: p.fullName || extraObj.name || p.name || 'Unnamed Client',
+    fullName: p.fullName || extraObj.name || p.name || 'Unnamed Client',
+    suburb: p.city || extraObj.suburb || '',
+    city: p.city || extraObj.suburb || '',
+    medicareCard: p.medicareNumber || extraObj.medicareCard || '',
+    medicareNumber: p.medicareNumber || extraObj.medicareCard || '',
+    privateHealthMemberNo: p.phiMemberNum || extraObj.privateHealthMemberNo || '',
+    phiMemberNum: p.phiMemberNum || extraObj.privateHealthMemberNo || '',
+    emergencyContactRelation: p.emergencyRelation || extraObj.emergencyContactRelation || '',
+    emergencyRelation: p.emergencyRelation || extraObj.emergencyContactRelation || '',
+    ndisNo: p.ndisNumber || extraObj.ndisNo || '',
+    ndisNumber: p.ndisNumber || extraObj.ndisNo || '',
+  }
+}
+
 // Patients
 const getPatients = async (req, res, next) => {
   try {
@@ -288,14 +319,31 @@ const getPatients = async (req, res, next) => {
     const whereClause = { clinicId }
     let patients = await prisma.patient.findMany({
       where: whereClause,
-      include: { user: { select: { id: true, role: true } } },
+      include: { user: { select: { id: true, role: true, profileData: true } } },
       orderBy: { createdAt: 'desc' }
     })
 
     // Exclude staff/admin accounts mistakenly linked to patient table (preserve valid patients with userId === null)
     patients = patients.filter(p => !p.user || p.user.role === 'PATIENT')
 
-    res.json({ success: true, data: patients })
+    const mapped = patients.map(p => formatPatientData(p))
+    res.json({ success: true, data: mapped })
+  } catch (err) {
+    next(err)
+  }
+}
+
+const getPatientById = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const patient = await prisma.patient.findUnique({
+      where: { id },
+      include: { user: { select: { id: true, role: true, profileData: true } } }
+    })
+    if (!patient) {
+      return res.status(404).json({ success: false, message: 'Patient not found' })
+    }
+    res.json({ success: true, data: formatPatientData(patient) })
   } catch (err) {
     next(err)
   }
@@ -311,13 +359,46 @@ const createPatient = async (req, res, next) => {
       if (practitioner && practitioner.clinicId) clinicId = practitioner.clinicId
     }
 
-    const patientData = {
-      ...req.body,
-      clinicId: clinicId || req.body.clinicId || null
+    const {
+      fullName, name, email, password, phone, dob, gender, address, suburb, city, state, postcode,
+      emergencyContactName, emergencyContactPhone, emergencyContactRelation, emergencyRelation,
+      gpName, gpClinic, gpPhone, medicareCard, medicareNumber, medicareRef, medicareExpiry,
+      ndisNo, ndisNumber, privateHealthFund, privateHealthMemberNo, phiMemberNum,
+      alerts, tags, diagnosis, status, notes, ...otherFields
+    } = req.body
+
+    const cleanData = {
+      clinicId: clinicId || req.body.clinicId || null,
+      fullName: fullName || name || 'New Client',
+      email: email || null,
+      phone: phone || null,
+      dob: dob || null,
+      gender: gender || 'Other',
+      address: address || null,
+      city: city || suburb || null,
+      state: state || null,
+      postcode: postcode || null,
+      emergencyContactName: emergencyContactName || null,
+      emergencyContactPhone: emergencyContactPhone || null,
+      emergencyRelation: emergencyRelation || emergencyContactRelation || null,
+      gpName: gpName || null,
+      gpClinic: gpClinic || null,
+      gpPhone: gpPhone || null,
+      medicareNumber: medicareNumber || medicareCard || null,
+      medicareRef: medicareRef || null,
+      medicareExpiry: medicareExpiry || null,
+      ndisNumber: ndisNumber || ndisNo || null,
+      privateHealthFund: privateHealthFund || null,
+      phiMemberNum: phiMemberNum || privateHealthMemberNo || null,
+      status: status || 'active',
+      tags: tags || [],
+      diagnosis: diagnosis || null,
+      alerts: alerts ? (typeof alerts === 'string' ? alerts : (Array.isArray(alerts) ? alerts.join(', ') : JSON.stringify(alerts))) : null,
+      notes: JSON.stringify(otherFields)
     }
 
-    const patient = await prisma.patient.create({ data: patientData })
-    res.json({ success: true, data: patient })
+    const patient = await prisma.patient.create({ data: cleanData })
+    res.json({ success: true, data: formatPatientData(patient) })
   } catch (err) {
     next(err)
   }
@@ -326,9 +407,102 @@ const createPatient = async (req, res, next) => {
 const updatePatient = async (req, res, next) => {
   try {
     const { id } = req.params
-    const patient = await prisma.patient.update({ where: { id }, data: req.body })
-    res.json({ success: true, data: patient })
+    const existing = await prisma.patient.findUnique({ where: { id } })
+    if (!existing) {
+      return res.status(404).json({ success: false, message: 'Patient not found' })
+    }
+
+    let existingExtra = {}
+    if (existing.notes) {
+      try {
+        existingExtra = typeof existing.notes === 'string' ? JSON.parse(existing.notes) : existing.notes
+      } catch (_) {
+        existingExtra = { customNotes: existing.notes }
+      }
+    }
+
+    const {
+      fullName, name, email, password, phone, dob, gender, address, suburb, city, state, postcode,
+      emergencyContactName, emergencyContactPhone, emergencyContactRelation, emergencyRelation,
+      gpName, gpClinic, gpPhone, medicareCard, medicareNumber, medicareRef, medicareExpiry,
+      ndisNo, ndisNumber, privateHealthFund, privateHealthMemberNo, phiMemberNum,
+      alerts, tags, diagnosis, status, notes, ...otherFields
+    } = req.body
+
+    const cleanData = {}
+    if (fullName !== undefined || name !== undefined) cleanData.fullName = fullName || name || existing.fullName
+    if (email !== undefined) cleanData.email = email || null
+    if (phone !== undefined) cleanData.phone = phone || null
+    if (dob !== undefined) cleanData.dob = dob || null
+    if (gender !== undefined) cleanData.gender = gender || null
+    if (address !== undefined) cleanData.address = address || null
+    if (city !== undefined || suburb !== undefined) cleanData.city = city || suburb || null
+    if (state !== undefined) cleanData.state = state || null
+    if (postcode !== undefined) cleanData.postcode = postcode || null
+    if (emergencyContactName !== undefined) cleanData.emergencyContactName = emergencyContactName || null
+    if (emergencyContactPhone !== undefined) cleanData.emergencyContactPhone = emergencyContactPhone || null
+    if (emergencyRelation !== undefined || emergencyContactRelation !== undefined) {
+      cleanData.emergencyRelation = emergencyRelation || emergencyContactRelation || null
+    }
+    if (gpName !== undefined) cleanData.gpName = gpName || null
+    if (gpClinic !== undefined) cleanData.gpClinic = gpClinic || null
+    if (gpPhone !== undefined) cleanData.gpPhone = gpPhone || null
+    if (medicareNumber !== undefined || medicareCard !== undefined) {
+      cleanData.medicareNumber = medicareNumber || medicareCard || null
+    }
+    if (medicareRef !== undefined) cleanData.medicareRef = medicareRef || null
+    if (medicareExpiry !== undefined) cleanData.medicareExpiry = medicareExpiry || null
+    if (ndisNumber !== undefined || ndisNo !== undefined) {
+      cleanData.ndisNumber = ndisNumber || ndisNo || null
+    }
+    if (privateHealthFund !== undefined) cleanData.privateHealthFund = privateHealthFund || null
+    if (phiMemberNum !== undefined || privateHealthMemberNo !== undefined) {
+      cleanData.phiMemberNum = phiMemberNum || privateHealthMemberNo || null
+    }
+    if (alerts !== undefined) {
+      cleanData.alerts = typeof alerts === 'string' ? alerts : (Array.isArray(alerts) ? alerts.join(', ') : JSON.stringify(alerts))
+    }
+    if (tags !== undefined) cleanData.tags = tags
+    if (diagnosis !== undefined) cleanData.diagnosis = diagnosis
+    if (status !== undefined) cleanData.status = status
+
+    // Store extended fields in notes JSON
+    const mergedExtra = {
+      ...(typeof existingExtra === 'object' && existingExtra !== null && !Array.isArray(existingExtra) ? existingExtra : {}),
+      ...otherFields,
+      ...(notes && typeof notes === 'string' && !notes.startsWith('{') ? { customNotes: notes } : {})
+    }
+    cleanData.notes = JSON.stringify(mergedExtra)
+
+    // Also update associated user account if exists
+    if (existing.userId) {
+      try {
+        const userUpdate = {}
+        if (cleanData.fullName) userUpdate.name = cleanData.fullName
+        if (cleanData.email) userUpdate.email = cleanData.email.toLowerCase().trim()
+        if (cleanData.phone) userUpdate.phone = cleanData.phone
+        if (password && String(password).trim().length > 0) {
+          const bcrypt = require('bcryptjs')
+          userUpdate.passwordHash = await bcrypt.hash(String(password).trim(), 10)
+        }
+        userUpdate.profileData = mergedExtra
+        await prisma.user.update({
+          where: { id: existing.userId },
+          data: userUpdate
+        }).catch(() => null)
+      } catch (userErr) {
+        console.warn('Notice updating linked user:', userErr.message)
+      }
+    }
+
+    const updated = await prisma.patient.update({
+      where: { id },
+      data: cleanData
+    })
+
+    res.json({ success: true, data: formatPatientData(updated) })
   } catch (err) {
+    console.error('Error updating patient:', err)
     next(err)
   }
 }
@@ -549,7 +723,7 @@ const updateProfile = async (req, res, next) => {
     const {
       title, firstName, lastName, name, gender, email, phone, mobile, dob,
       profTitle, locations, services, signature, providerNumbers,
-      currentPassword, newPassword
+      currentPassword, newPassword, avatarUrl
     } = req.body
 
     const updateName = name || (firstName && lastName ? `${firstName} ${lastName}` : firstName || lastName)
@@ -557,6 +731,8 @@ const updateProfile = async (req, res, next) => {
     let user = null
     if (userId) {
       user = await prisma.user.findUnique({ where: { id: userId } }).catch(() => null)
+    } else if (userEmail) {
+      user = await prisma.user.findUnique({ where: { email: userEmail } }).catch(() => null)
     }
 
     if (newPassword && user && user.passwordHash) {
@@ -569,20 +745,21 @@ const updateProfile = async (req, res, next) => {
       const salt = await bcrypt.genSalt(10)
       const newPasswordHash = await bcrypt.hash(newPassword, salt)
       await prisma.user.update({
-        where: { id: userId },
+        where: { id: user.id },
         data: { passwordHash: newPasswordHash }
       }).catch(() => null)
     }
 
-    if (userId && (updateName || email || phone || mobile)) {
-      await prisma.user.update({
-        where: { id: userId },
+    if (user && (updateName || email || phone || mobile || avatarUrl !== undefined)) {
+      user = await prisma.user.update({
+        where: { id: user.id },
         data: {
           ...(updateName && { name: updateName }),
           ...(email && { email }),
-          ...((phone || mobile) && { phone: phone || mobile })
+          ...((phone || mobile) && { phone: phone || mobile }),
+          ...(avatarUrl !== undefined && { avatarUrl: avatarUrl || null })
         }
-      }).catch(() => null)
+      }).catch(() => user)
     }
 
     let practitioner = await prisma.practitioner.findFirst({
@@ -611,7 +788,10 @@ const updateProfile = async (req, res, next) => {
     res.json({
       success: true,
       message: 'Practitioner profile settings saved successfully in live database!',
-      data: practitioner
+      data: {
+        ...practitioner,
+        avatarUrl: user?.avatarUrl || avatarUrl || null
+      }
     })
   } catch (err) {
     next(err)
@@ -909,6 +1089,7 @@ module.exports = {
   updateWaitlistStatus,
   removeFromWaitlist,
   getPatients,
+  getPatientById,
   createPatient,
   updatePatient,
   getPayments,
