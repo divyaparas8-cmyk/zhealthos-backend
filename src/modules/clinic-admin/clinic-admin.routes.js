@@ -57,6 +57,7 @@ router.get('/patients/:id', controller.getPatientById)
 router.post('/patients', controller.createPatient)
 router.put('/patients/:id', controller.updatePatient)
 router.delete('/patients/:id', controller.deletePatient)
+router.post('/patients/:id/send-invite', controller.sendPortalInvite)
 
 const practitionerController = require('../practitioner/practitioner.controller')
 router.get('/cases', practitionerController.getCases)
@@ -111,6 +112,8 @@ router.delete('/settings/tags/:id', controller.deleteClientTag)
 router.get('/communications', controller.getCommunications)
 router.post('/communications', controller.createCommunication)
 router.delete('/communications/:id', controller.deleteCommunication)
+
+router.post('/settings/clear-test-data', controller.clearSampleTestData)
 
 module.exports = router
 

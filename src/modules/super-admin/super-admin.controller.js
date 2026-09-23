@@ -133,15 +133,26 @@ const getSubscriptionPlans = async (req, res, next) => {
 
 const createSubscriptionPlan = async (req, res, next) => {
   try {
-    const { name, monthlyPrice, features } = req.body
+    const { name, monthlyPrice, yearlyPrice, features, isActive } = req.body
+    if (!name) {
+      return res.status(400).json({ success: false, message: 'Plan name is required' })
+    }
+    const formattedFeatures = Array.isArray(features)
+      ? features
+      : typeof features === 'string'
+      ? features.split('\n').map(f => f.trim()).filter(Boolean)
+      : []
+
     const newPlan = await prisma.subscriptionPlan.create({
       data: {
-        name,
-        monthlyPrice: parseFloat(monthlyPrice),
-        features: features || [],
+        name: name.trim(),
+        monthlyPrice: parseFloat(monthlyPrice) || 0,
+        yearlyPrice: yearlyPrice !== undefined && yearlyPrice !== null && yearlyPrice !== '' ? parseFloat(yearlyPrice) : null,
+        features: formattedFeatures,
+        isActive: isActive !== undefined ? Boolean(isActive) : true,
       }
     })
-    res.status(201).json({ success: true, data: newPlan })
+    res.status(201).json({ success: true, data: newPlan, message: 'Subscription Plan created successfully' })
   } catch (err) {
     next(err)
   }
@@ -150,19 +161,28 @@ const createSubscriptionPlan = async (req, res, next) => {
 const updateSubscriptionPlan = async (req, res, next) => {
   try {
     const { id } = req.params
-    const { name, monthlyPrice, features, isActive } = req.body
+    const { name, monthlyPrice, yearlyPrice, features, isActive } = req.body
     
     const data = {}
-    if (name !== undefined) data.name = name
-    if (monthlyPrice !== undefined) data.monthlyPrice = parseFloat(monthlyPrice)
-    if (features !== undefined) data.features = features
-    if (isActive !== undefined) data.isActive = isActive
+    if (name !== undefined) data.name = name.trim()
+    if (monthlyPrice !== undefined) data.monthlyPrice = parseFloat(monthlyPrice) || 0
+    if (yearlyPrice !== undefined) {
+      data.yearlyPrice = yearlyPrice !== null && yearlyPrice !== '' ? parseFloat(yearlyPrice) : null
+    }
+    if (features !== undefined) {
+      data.features = Array.isArray(features)
+        ? features
+        : typeof features === 'string'
+        ? features.split('\n').map(f => f.trim()).filter(Boolean)
+        : []
+    }
+    if (isActive !== undefined) data.isActive = Boolean(isActive)
 
     const updatedPlan = await prisma.subscriptionPlan.update({
       where: { id },
       data
     })
-    res.json({ success: true, data: updatedPlan })
+    res.json({ success: true, data: updatedPlan, message: 'Subscription Plan updated successfully' })
   } catch (err) {
     next(err)
   }
@@ -172,7 +192,7 @@ const deleteSubscriptionPlan = async (req, res, next) => {
   try {
     const { id } = req.params
     await prisma.subscriptionPlan.delete({ where: { id } })
-    res.json({ success: true, message: 'Subscription Plan deleted' })
+    res.json({ success: true, message: 'Subscription Plan deleted successfully' })
   } catch (err) {
     next(err)
   }

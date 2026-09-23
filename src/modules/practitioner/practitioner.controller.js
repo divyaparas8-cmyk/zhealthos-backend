@@ -21,6 +21,25 @@ const getClinicIdFromReq = async (req) => {
   return clinicId || null
 }
 
+const getPractitionerFromReq = async (req) => {
+  if (!req?.user) return null
+  const userId = req.user.id
+  const userEmail = req.user.email?.toLowerCase().trim()
+
+  let practitioner = null
+  if (userId) {
+    practitioner = await prisma.practitioner.findFirst({
+      where: { userId }
+    }).catch(() => null)
+  }
+  if (!practitioner && userEmail) {
+    practitioner = await prisma.practitioner.findFirst({
+      where: { email: userEmail }
+    }).catch(() => null)
+  }
+  return practitioner
+}
+
 let inMemoryOutcomeMeasures = []
 
 // Appointments
@@ -28,20 +47,29 @@ const getAppointments = async (req, res, next) => {
   try {
     const { search, date, status, practitionerId, patientId } = req.query
     const userClinicId = await getClinicIdFromReq(req)
-    const whereClause = userClinicId ? { OR: [{ clinicId: userClinicId }, { clinicId: null }] } : {}
+    const practitioner = await getPractitionerFromReq(req)
+    const effectiveClinicId = userClinicId || practitioner?.clinicId
+
+    const whereClause = effectiveClinicId ? { OR: [{ clinicId: effectiveClinicId }, { clinicId: null }] } : {}
     let appointments = await prisma.appointment.findMany({ where: whereClause, orderBy: { createdAt: 'desc' } })
-
-
 
     let filtered = appointments
 
-    // RBAC & Filter for Practitioner
-    if (practitionerId) {
+    // RBAC & Strict isolation for Practitioner
+    if (practitioner) {
+      const pracCleanName = (practitioner.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+      const userCleanName = (req.user?.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+      filtered = filtered.filter(a => {
+        if (a.practitionerId && a.practitionerId === practitioner.id) return true
+        const aPracName = (a.practitionerName || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+        if (pracCleanName && aPracName && (aPracName.includes(pracCleanName) || pracCleanName.includes(aPracName))) return true
+        if (userCleanName && aPracName && (aPracName.includes(userCleanName) || userCleanName.includes(aPracName))) return true
+        return false
+      })
+    } else if (practitionerId) {
       filtered = filtered.filter(a =>
         a.practitionerId === practitionerId ||
-        !a.practitionerId ||
-        (a.practitionerName || '').toLowerCase().includes(practitionerId.toLowerCase()) ||
-        (req.user && req.user.name && (a.practitionerName || '').toLowerCase().includes(req.user.name.toLowerCase()))
+        (a.practitionerName || '').toLowerCase().includes(practitionerId.toLowerCase())
       )
     }
 
@@ -145,13 +173,36 @@ const updateAppointment = async (req, res, next) => {
     if (patientId !== undefined) updateData.patientId = patientId
     if (patientName !== undefined) updateData.patientName = patientName
     if (practitionerId !== undefined) {
-      updateData.practitionerId = practitionerId
-      if (!practitionerName && practitionerId) {
+      if (practitionerId) {
         const foundPrac = await prisma.practitioner.findUnique({ where: { id: practitionerId } }).catch(() => null)
-        if (foundPrac) updateData.practitionerName = foundPrac.name
+        if (foundPrac) {
+          updateData.practitionerId = foundPrac.id
+          updateData.practitionerName = foundPrac.name
+        } else {
+          const foundByName = await prisma.practitioner.findFirst({
+            where: { name: { contains: practitionerName || practitionerId, mode: 'insensitive' } }
+          }).catch(() => null)
+          if (foundByName) {
+            updateData.practitionerId = foundByName.id
+            updateData.practitionerName = foundByName.name
+          } else {
+            updateData.practitionerId = null
+            if (practitionerName) updateData.practitionerName = practitionerName
+          }
+        }
+      } else {
+        updateData.practitionerId = null
+        if (practitionerName) updateData.practitionerName = practitionerName
+      }
+    } else if (practitionerName !== undefined && practitionerName) {
+      updateData.practitionerName = practitionerName
+      const foundByName = await prisma.practitioner.findFirst({
+        where: { name: { contains: practitionerName, mode: 'insensitive' } }
+      }).catch(() => null)
+      if (foundByName) {
+        updateData.practitionerId = foundByName.id
       }
     }
-    if (practitionerName !== undefined && practitionerName) updateData.practitionerName = practitionerName
     if (serviceName !== undefined || appointmentType !== undefined) updateData.serviceName = serviceName || appointmentType
     if (branchId !== undefined) updateData.branchId = branchId
     if (branchName !== undefined) updateData.branchName = branchName
@@ -304,11 +355,12 @@ const formatPatientData = (p) => {
 const getPatients = async (req, res, next) => {
   try {
     let clinicId = req.user?.clinicId
+    const practitioner = await getPractitionerFromReq(req)
+    if (!clinicId && practitioner?.clinicId) {
+      clinicId = practitioner.clinicId
+    }
     if (!clinicId && req.user?.id) {
-      const practitioner = await prisma.practitioner.findFirst({
-        where: { OR: [{ userId: req.user.id }, { email: req.user.email }] }
-      }).catch(() => null)
-      if (practitioner && practitioner.clinicId) clinicId = practitioner.clinicId
+      clinicId = await getClinicIdFromReq(req)
     }
 
     // Strict multi-tenant safety: if no clinicId is found, return empty array (prevent cross-tenant query)
@@ -325,6 +377,58 @@ const getPatients = async (req, res, next) => {
 
     // Exclude staff/admin accounts mistakenly linked to patient table (preserve valid patients with userId === null)
     patients = patients.filter(p => !p.user || p.user.role === 'PATIENT')
+
+    // Restrict strictly to practitioner's assigned patients
+    if (practitioner) {
+      const pracCleanName = (practitioner.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+      const userCleanName = (req.user?.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+
+      const pracAppts = await prisma.appointment.findMany({
+        where: {
+          OR: [
+            { practitionerId: practitioner.id },
+            ...(pracCleanName ? [{ practitionerName: { contains: pracCleanName } }] : []),
+            ...(userCleanName ? [{ practitionerName: { contains: userCleanName } }] : [])
+          ]
+        },
+        select: { patientId: true, patientName: true }
+      }).catch(() => [])
+
+      const pracDocs = await prisma.document.findMany({
+        where: {
+          OR: [
+            { practitionerId: practitioner.id },
+            ...(pracCleanName ? [{ uploadBy: { contains: pracCleanName } }] : [])
+          ]
+        },
+        select: { patientId: true, patientName: true }
+      }).catch(() => [])
+
+      const assignedPatientIds = new Set(
+        [...pracAppts.map(a => a.patientId), ...pracDocs.map(d => d.patientId)].filter(Boolean)
+      )
+      const assignedPatientNames = new Set(
+        [...pracAppts.map(a => a.patientName), ...pracDocs.map(d => d.patientName)]
+          .filter(Boolean)
+          .map(n => n.toLowerCase().trim())
+      )
+
+      patients = patients.filter(p => {
+        if (assignedPatientIds.has(p.id)) return true
+        const pName = (p.fullName || p.name || '').toLowerCase().trim()
+        if (pName && assignedPatientNames.has(pName)) return true
+        if (p.notes) {
+          try {
+            const extra = typeof p.notes === 'string' ? JSON.parse(p.notes) : p.notes
+            if (extra.practitionerId === practitioner.id) return true
+            if (extra.assignedPractitionerId === practitioner.id) return true
+            const extraPrac = (extra.practitionerName || extra.assignedPractitioner || '').toLowerCase()
+            if (pracCleanName && extraPrac.includes(pracCleanName)) return true
+          } catch (_) {}
+        }
+        return false
+      })
+    }
 
     const mapped = patients.map(p => formatPatientData(p))
     res.json({ success: true, data: mapped })
@@ -1169,9 +1273,21 @@ async function getDashboardStats(req, res, next) {
     const effectiveClinicId = userClinicId || pRecord?.clinicId
 
     // Scoped practitioner filter for appointments & stats
-    const practitionerFilter = effectiveClinicId
-      ? { OR: [{ clinicId: effectiveClinicId }, { clinicId: null }] }
-      : {}
+    const pracCleanName = (pRecord?.name || '').replace(/dr\.?\s*/i, '').trim()
+    const userCleanName = (req.user?.name || '').replace(/dr\.?\s*/i, '').trim()
+
+    const practitionerFilter = {
+      ...(effectiveClinicId ? { clinicId: effectiveClinicId } : {}),
+      ...(practitionerId || pracCleanName || userCleanName
+        ? {
+            OR: [
+              ...(practitionerId ? [{ practitionerId }] : []),
+              ...(pracCleanName ? [{ practitionerName: { contains: pracCleanName } }] : []),
+              ...(userCleanName ? [{ practitionerName: { contains: userCleanName } }] : [])
+            ]
+          }
+        : {})
+    }
 
     // ── Appointments ──────────────────────────────────────────────────────────
     const [todayAppointmentsCount, totalAppointmentsCount, weekAppointments, todayCompleted, todayCancelled, monthTotal] = await Promise.all([
@@ -1187,8 +1303,8 @@ async function getDashboardStats(req, res, next) {
       where: { date: { gte: monthStart, lte: monthEnd }, status: { in: ['Completed', 'Arrived'] }, ...practitionerFilter }
     })
 
-    // Display appointments (use today count or total active sessions count)
-    const todayAppointments = todayAppointmentsCount > 0 ? todayAppointmentsCount : (totalAppointmentsCount > 0 ? totalAppointmentsCount : 1)
+    // Display appointments — strictly today's count, no fallback to all-time total
+    const todayAppointments = todayAppointmentsCount
 
     // ── Patients ──────────────────────────────────────────────────────────────
     const practitionerAppts = await prisma.appointment.findMany({

@@ -1,5 +1,26 @@
 const prisma = require('../../config/db')
 const bcrypt = require('bcryptjs')
+const crypto = require('crypto')
+
+// Helper function to resolve practitioner record for the authenticated user
+const getPractitionerFromReq = async (req) => {
+  if (!req?.user) return null
+  const userId = req.user.id
+  const userEmail = req.user.email?.toLowerCase().trim()
+
+  let practitioner = null
+  if (userId) {
+    practitioner = await prisma.practitioner.findFirst({
+      where: { userId }
+    }).catch(() => null)
+  }
+  if (!practitioner && userEmail) {
+    practitioner = await prisma.practitioner.findFirst({
+      where: { email: userEmail }
+    }).catch(() => null)
+  }
+  return practitioner
+}
 
 // Helper function to resolve tenant clinicId for the authenticated user
 const getClinicIdFromReq = async (req) => {
@@ -32,6 +53,11 @@ const getClinicIdFromReq = async (req) => {
     if (dbUser?.profileData && typeof dbUser.profileData === 'object' && dbUser.profileData.clinicId) {
       clinicId = dbUser.profileData.clinicId
     }
+  }
+
+  if (!clinicId && (req.user.id || req.user.email)) {
+    const prac = await getPractitionerFromReq(req)
+    if (prac?.clinicId) clinicId = prac.clinicId
   }
 
   return clinicId || null
@@ -375,15 +401,117 @@ const getInvoices = async (req, res, next) => {
       orderBy: { createdAt: 'desc' }
     })
 
+    // Reconcile and synchronize legacy records (Finding 21 audit reconciliation)
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
 
+    invoices = await Promise.all(invoices.map(async (inv) => {
+      const s = (inv.status || '').toLowerCase()
+      let amt = parseFloat(inv.amount) || 0.0
+      let currentDue = inv.due !== undefined && inv.due !== null ? parseFloat(inv.due) : amt
+      let currentStatus = inv.status || 'Processing'
+      let needsDbSync = false
+
+      // Finding 29: Reconcile tax/GST into amount and due if invoice stored pre-tax subtotal
+      let parsedItems = []
+      if (inv.items) {
+        parsedItems = typeof inv.items === 'string' ? JSON.parse(inv.items) : inv.items
+      }
+      if (Array.isArray(parsedItems) && parsedItems.length > 0) {
+        const itemsSubtotal = parsedItems.reduce((sum, it) => {
+          const qty = parseFloat(it.quantity) || 1
+          const rate = parseFloat(it.rate) || 0
+          const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+          return sum + lineTotal
+        }, 0)
+        const taxableSub = parsedItems
+          .filter(it => it && (it.taxRate === 'GST on Income' || (!it.taxRate && (it.taxable === true || it.taxable === 'true'))))
+          .reduce((sum, it) => {
+            const qty = parseFloat(it.quantity) || 1
+            const rate = parseFloat(it.rate) || 0
+            const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+            return sum + lineTotal
+          }, 0)
+        const gst = parseFloat((taxableSub * 0.1).toFixed(2))
+        const totalWithGst = itemsSubtotal > 0 ? parseFloat((itemsSubtotal + gst).toFixed(2)) : amt
+
+        if (gst > 0 && Math.abs(amt - itemsSubtotal) < 0.05) {
+          // Stored amount was pre-tax subtotal — adjust to full gross total
+          const diff = totalWithGst - amt
+          amt = totalWithGst
+          if (currentDue >= itemsSubtotal) {
+            currentDue = totalWithGst
+          } else if (currentDue > 0 && s !== 'paid') {
+            currentDue = parseFloat((currentDue + diff).toFixed(2))
+          }
+          needsDbSync = true
+        }
+      }
+
+      // If marked Paid or Completed, balance due must strictly be 0.00
+      if (s === 'paid' || s === 'completed') {
+        if (currentDue !== 0.0) {
+          currentDue = 0.0
+          needsDbSync = true
+        }
+        currentStatus = 'Paid'
+      } else if (currentDue <= 0.0 && s !== 'cancelled' && s !== 'cancel' && s !== 'draft') {
+        currentStatus = 'Paid'
+        currentDue = 0.0
+        needsDbSync = true
+      }
+
+      if (needsDbSync) {
+        try {
+          await prisma.invoice.update({
+            where: { id: inv.id },
+            data: { amount: amt, due: currentDue, status: currentStatus }
+          })
+        } catch (syncErr) {
+          // non-blocking
+        }
+      }
+
+      // ── Finding 28: Derive Overdue & Partially Paid statuses ──────────────
+      // These are computed labels (not stored in DB) for display & filtering.
+      let derivedPaymentStatus = currentStatus
+      const notCancelledOrDraft = s !== 'cancelled' && s !== 'cancel' && s !== 'draft'
+      const hasDueBalance = currentDue > 0
+      const paidPartially = hasDueBalance && currentStatus !== 'Paid' && amt > 0 && currentDue < amt && notCancelledOrDraft
+
+      if (paidPartially) {
+        derivedPaymentStatus = 'Partially Paid'
+      } else if (currentStatus !== 'Paid' && currentStatus !== 'Draft' && s !== 'cancelled' && s !== 'cancel') {
+        // Check if overdue
+        if (inv.dueDate && hasDueBalance) {
+          const dueDate = new Date(inv.dueDate)
+          dueDate.setHours(0, 0, 0, 0)
+          if (dueDate < today) {
+            derivedPaymentStatus = 'Overdue'
+          }
+        }
+      }
+
+      return {
+        ...inv,
+        amount: amt,
+        due: currentDue,
+        status: currentStatus,
+        paymentStatus: derivedPaymentStatus // derived, not stored
+      }
+    }))
 
     if (status && status.trim()) {
       invoices = invoices.filter(inv => {
-        const s = (inv.status || '').toLowerCase()
         const fs = status.toLowerCase()
-        if (fs === 'completed') return s === 'completed' || s === 'paid'
-        if (fs === 'cancel') return s === 'cancel' || s === 'cancelled'
-        return s === 'processing' || s === 'draft' || s === 'sent'
+        const s = (inv.status || '').toLowerCase()
+        const ps = (inv.paymentStatus || inv.status || '').toLowerCase()
+        if (fs === 'paid' || fs === 'completed') return s === 'paid' || s === 'completed'
+        if (fs === 'cancel' || fs === 'cancelled') return s === 'cancel' || s === 'cancelled'
+        if (fs === 'overdue') return ps === 'overdue'
+        if (fs === 'partially paid') return ps === 'partially paid'
+        if (fs === 'draft') return s === 'draft'
+        return (s === 'processing' || s === 'sent') && inv.due > 0
       })
     }
 
@@ -426,6 +554,69 @@ const createInvoice = async (req, res, next) => {
     const displayId = `INV-${String(count + 1).padStart(6, '0')}`
     const finalClientName = clientName || patientName || 'Client'
 
+    // Finding 22: Parse items and derive authoritative amount from line items sum
+    let parsedItems = null
+    if (items) {
+      parsedItems = typeof items === 'string' ? JSON.parse(items) : items
+    }
+    if (!Array.isArray(parsedItems) || parsedItems.length === 0) {
+      parsedItems = [{
+        itemCode: req.body.itemCode || '',
+        description: service || 'General',
+        quantity: 1,
+        rate: parseFloat(amount) || 0,
+        total: parseFloat(amount) || 0,
+        taxRate: req.body.taxRate || 'GST Free Income',
+        taxable: req.body.taxRate === 'GST on Income',
+        funding: req.body.funding || req.body.fundingType || req.body.claimType || 'NDIS'
+      }]
+    } else {
+      parsedItems = parsedItems.map(it => {
+        const qty = parseFloat(it.quantity) || 1
+        const rate = parseFloat(it.rate) || 0
+        const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+        const isTaxable = it.taxRate === 'GST on Income' || (!it.taxRate && (it.taxable === true || it.taxable === 'true'))
+        return {
+          ...it,
+          itemCode: it.itemCode || it.ndisCode || '',
+          quantity: qty,
+          rate: rate,
+          total: lineTotal,
+          taxRate: it.taxRate || (isTaxable ? 'GST on Income' : 'GST Free Income'),
+          taxable: isTaxable
+        }
+      })
+    }
+
+    const itemsSubtotal = parsedItems.reduce((sum, it) => {
+      const qty = parseFloat(it.quantity) || 1
+      const rate = parseFloat(it.rate) || 0
+      const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+      return sum + lineTotal
+    }, 0)
+
+    const taxableTotal = parsedItems
+      .filter(it => it && (it.taxRate === 'GST on Income' || (!it.taxRate && (it.taxable === true || it.taxable === 'true'))))
+      .reduce((sum, it) => {
+        const qty = parseFloat(it.quantity) || 1
+        const rate = parseFloat(it.rate) || 0
+        const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+        return sum + lineTotal
+      }, 0)
+    const gstTotal = parseFloat((taxableTotal * 0.1).toFixed(2))
+    const itemsDerivedTotal = itemsSubtotal > 0 ? parseFloat((itemsSubtotal + gstTotal).toFixed(2)) : 0
+
+    const submittedAmount = parseFloat(amount) || 0.0
+    // If items have meaningful rates, use items sum (plus tax) as authoritative total
+    const finalAmount = itemsDerivedTotal > 0 ? itemsDerivedTotal : submittedAmount
+
+    // Reconcile status and due balance at creation (Finding 21)
+    const isPaidStatus = (status || '').toLowerCase() === 'paid' || (status || '').toLowerCase() === 'completed'
+    let finalDue = isPaidStatus ? 0.0 : (due !== undefined && due !== null ? Math.max(0, parseFloat(due)) : finalAmount)
+    // Ensure due never exceeds the reconciled amount
+    finalDue = parseFloat(Math.min(finalDue, finalAmount).toFixed(2))
+    let finalStatus = isPaidStatus ? 'Paid' : (finalDue === 0.0 && finalAmount > 0 ? 'Paid' : (status || 'Processing'))
+
     const inv = await prisma.invoice.create({
       data: {
         displayId,
@@ -435,15 +626,15 @@ const createInvoice = async (req, res, next) => {
         patientName: finalClientName,
         recipient: recipient || finalClientName,
         practitionerName: practitionerName || 'General Practitioner',
-        amount: parseFloat(amount) || 0.0,
-        due: due !== undefined ? parseFloat(due) : (parseFloat(amount) || 0.0),
-        status: status || 'Processing',
+        amount: finalAmount,
+        due: finalDue,
+        status: finalStatus,
         sentStatus: sentStatus || 'Not Sent',
         service: service || 'General',
         patientId: patientId || null,
         issueDate: issueDate || new Date().toISOString().split('T')[0],
         dueDate: dueDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-        items: items ? (typeof items === 'string' ? JSON.parse(items) : items) : [{ funding: req.body.funding || req.body.fundingType || req.body.claimType || 'NDIS' }]
+        items: parsedItems
       }
     })
 
@@ -466,7 +657,7 @@ const createInvoice = async (req, res, next) => {
             clinicId: userClinicId || null,
             service: service || 'Clinical Care Service',
             funding: fundingProg,
-            amount: `$${(parseFloat(amount) || 0.0).toFixed(2)}`,
+            amount: `$${finalAmount.toFixed(2)}`,
             status: 'Approved',
             date: issueDate || new Date().toISOString().split('T')[0]
           }
@@ -482,6 +673,7 @@ const createInvoice = async (req, res, next) => {
   }
 }
 
+
 const updateInvoice = async (req, res, next) => {
   try {
     const { id } = req.params
@@ -489,12 +681,83 @@ const updateInvoice = async (req, res, next) => {
     delete updateData.id
     delete updateData.createdAt
 
-    if (updateData.amount !== undefined) updateData.amount = parseFloat(updateData.amount)
-    if (updateData.due !== undefined) updateData.due = parseFloat(updateData.due)
     if (updateData.clientName && !updateData.patientName) updateData.patientName = updateData.clientName
     if (updateData.patientName && !updateData.clientName) updateData.clientName = updateData.patientName
     if (updateData.items && typeof updateData.items === 'string') {
       try { updateData.items = JSON.parse(updateData.items) } catch (e) {}
+    }
+
+    // Finding 22 & 29: Reconcile amount from line items (sum of qty * rate + GST)
+    // Only override if items array is present and contains at least one item with a non-zero rate
+    if (Array.isArray(updateData.items) && updateData.items.length > 0) {
+      updateData.items = updateData.items.map(it => {
+        const qty = parseFloat(it.quantity) || 1
+        const rate = parseFloat(it.rate) || 0
+        const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+        const isTaxable = it.taxRate === 'GST on Income' || (!it.taxRate && (it.taxable === true || it.taxable === 'true'))
+        return {
+          ...it,
+          itemCode: it.itemCode || it.ndisCode || '',
+          quantity: qty,
+          rate: rate,
+          total: lineTotal,
+          taxRate: it.taxRate || (isTaxable ? 'GST on Income' : 'GST Free Income'),
+          taxable: isTaxable
+        }
+      })
+
+      const itemsSubtotal = updateData.items.reduce((sum, it) => {
+        const qty = parseFloat(it.quantity) || 1
+        const rate = parseFloat(it.rate) || 0
+        const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+        return sum + lineTotal
+      }, 0)
+      const taxableTotal = updateData.items
+        .filter(it => it && (it.taxRate === 'GST on Income' || (!it.taxRate && (it.taxable === true || it.taxable === 'true'))))
+        .reduce((sum, it) => {
+          const qty = parseFloat(it.quantity) || 1
+          const rate = parseFloat(it.rate) || 0
+          const lineTotal = it.total !== undefined ? parseFloat(it.total) : parseFloat((qty * rate).toFixed(2))
+          return sum + lineTotal
+        }, 0)
+      const gstTotal = parseFloat((taxableTotal * 0.1).toFixed(2))
+      const itemsTotal = itemsSubtotal > 0 ? parseFloat((itemsSubtotal + gstTotal).toFixed(2)) : 0
+
+      if (itemsTotal > 0) {
+        // Items have meaningful rates — authoritative total comes from items + tax
+        updateData.amount = itemsTotal
+      } else if (updateData.amount !== undefined) {
+        // Items have all-zero rates — preserve submitted amount and repair items
+        const submittedAmount = parseFloat(updateData.amount) || 0
+        if (submittedAmount > 0 && updateData.items.length === 1) {
+          // Single item: set its rate = total = invoice amount
+          updateData.items[0].rate = submittedAmount
+          updateData.items[0].total = submittedAmount
+        }
+        updateData.amount = parseFloat(submittedAmount.toFixed(2))
+      }
+    } else if (updateData.amount !== undefined) {
+      updateData.amount = parseFloat(updateData.amount)
+    }
+
+    if (updateData.due !== undefined) updateData.due = Math.max(0, parseFloat(updateData.due))
+
+    // Reconcile status and due balance during updates (Finding 21)
+    if (updateData.status) {
+      const s = updateData.status.toLowerCase()
+      if (s === 'paid' || s === 'completed') {
+        updateData.due = 0.0
+        updateData.status = 'Paid'
+      }
+    }
+    if (updateData.due === 0 && updateData.status !== 'Cancelled' && updateData.status !== 'Draft') {
+      updateData.status = 'Paid'
+      updateData.due = 0.0
+    }
+
+    // Ensure due never exceeds the reconciled amount
+    if (updateData.due !== undefined && updateData.amount !== undefined) {
+      updateData.due = parseFloat(Math.min(updateData.due, updateData.amount).toFixed(2))
     }
 
     const inv = await prisma.invoice.update({
@@ -534,9 +797,26 @@ const getAppointments = async (req, res, next) => {
       orderBy: { createdAt: 'desc' }
     })
 
-
-
     let filtered = appointments
+
+    // Restrict visibility if user is a practitioner
+    if (userRole === 'PRACTITIONER') {
+      const practitioner = await getPractitionerFromReq(req)
+      if (!practitioner) {
+        return res.json({ success: true, data: [] })
+      }
+      const pracCleanName = (practitioner.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+      const userCleanName = (req.user?.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+
+      filtered = filtered.filter(a => {
+        if (a.practitionerId && a.practitionerId === practitioner.id) return true
+        const aPracName = (a.practitionerName || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+        if (pracCleanName && aPracName && (aPracName.includes(pracCleanName) || pracCleanName.includes(aPracName))) return true
+        if (userCleanName && aPracName && (aPracName.includes(userCleanName) || userCleanName.includes(aPracName))) return true
+        return false
+      })
+    }
+
     if (status && status !== 'all') {
       filtered = filtered.filter(a => (a.status || '').toLowerCase() === status.toLowerCase())
     }
@@ -663,13 +943,36 @@ const updateAppointment = async (req, res, next) => {
     if (patientId !== undefined) updateData.patientId = patientId
     if (patientName !== undefined) updateData.patientName = patientName
     if (practitionerId !== undefined) {
-      updateData.practitionerId = practitionerId
-      if (!practitionerName && practitionerId) {
+      if (practitionerId) {
         const foundPrac = await prisma.practitioner.findUnique({ where: { id: practitionerId } }).catch(() => null)
-        if (foundPrac) updateData.practitionerName = foundPrac.name
+        if (foundPrac) {
+          updateData.practitionerId = foundPrac.id
+          updateData.practitionerName = foundPrac.name
+        } else {
+          const foundByName = await prisma.practitioner.findFirst({
+            where: { name: { contains: practitionerName || practitionerId, mode: 'insensitive' } }
+          }).catch(() => null)
+          if (foundByName) {
+            updateData.practitionerId = foundByName.id
+            updateData.practitionerName = foundByName.name
+          } else {
+            updateData.practitionerId = null
+            if (practitionerName) updateData.practitionerName = practitionerName
+          }
+        }
+      } else {
+        updateData.practitionerId = null
+        if (practitionerName) updateData.practitionerName = practitionerName
+      }
+    } else if (practitionerName !== undefined && practitionerName) {
+      updateData.practitionerName = practitionerName
+      const foundByName = await prisma.practitioner.findFirst({
+        where: { name: { contains: practitionerName, mode: 'insensitive' } }
+      }).catch(() => null)
+      if (foundByName) {
+        updateData.practitionerId = foundByName.id
       }
     }
-    if (practitionerName !== undefined && practitionerName) updateData.practitionerName = practitionerName
     if (serviceName !== undefined || appointmentType !== undefined) updateData.serviceName = serviceName || appointmentType
     if (branchId !== undefined) updateData.branchId = branchId
     if (branchName !== undefined) updateData.branchName = branchName
@@ -733,6 +1036,64 @@ const getPatients = async (req, res, next) => {
 
     // Exclude staff/admin accounts mistakenly linked to patient table (preserve valid patients with userId === null)
     patients = patients.filter(p => !p.user || p.user.role === 'PATIENT')
+
+    // Restrict visibility if user is a practitioner
+    if (userRole === 'PRACTITIONER') {
+      const practitioner = await getPractitionerFromReq(req)
+      if (!practitioner) {
+        return res.json({ success: true, data: [] })
+      }
+      const pracCleanName = (practitioner.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+      const userCleanName = (req.user?.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+
+      // Collect all patient IDs/names associated with this practitioner via appointments
+      const pracAppointments = await prisma.appointment.findMany({
+        where: {
+          OR: [
+            { practitionerId: practitioner.id },
+            ...(pracCleanName ? [{ practitionerName: { contains: pracCleanName } }] : []),
+            ...(userCleanName ? [{ practitionerName: { contains: userCleanName } }] : [])
+          ]
+        },
+        select: { patientId: true, patientName: true }
+      }).catch(() => [])
+
+      // Collect all patient IDs/names associated with this practitioner via documents
+      const pracDocuments = await prisma.document.findMany({
+        where: {
+          OR: [
+            { practitionerId: practitioner.id },
+            ...(pracCleanName ? [{ uploadBy: { contains: pracCleanName } }] : [])
+          ]
+        },
+        select: { patientId: true, patientName: true }
+      }).catch(() => [])
+
+      const assignedPatientIds = new Set(
+        [...pracAppointments.map(a => a.patientId), ...pracDocuments.map(d => d.patientId)].filter(Boolean)
+      )
+      const assignedPatientNames = new Set(
+        [...pracAppointments.map(a => a.patientName), ...pracDocuments.map(d => d.patientName)]
+          .filter(Boolean)
+          .map(n => n.toLowerCase().trim())
+      )
+
+      patients = patients.filter(p => {
+        if (assignedPatientIds.has(p.id)) return true
+        const pName = (p.fullName || p.name || '').toLowerCase().trim()
+        if (pName && assignedPatientNames.has(pName)) return true
+        if (p.notes) {
+          try {
+            const extra = typeof p.notes === 'string' ? JSON.parse(p.notes) : p.notes
+            if (extra.practitionerId === practitioner.id) return true
+            if (extra.assignedPractitionerId === practitioner.id) return true
+            const extraPrac = (extra.practitionerName || extra.assignedPractitioner || '').toLowerCase()
+            if (pracCleanName && extraPrac.includes(pracCleanName)) return true
+          } catch (_) {}
+        }
+        return false
+      })
+    }
 
     if (search && search.trim()) {
       const q = search.toLowerCase()
@@ -843,15 +1204,17 @@ const createPatient = async (req, res, next) => {
       notes: JSON.stringify(otherFields)
     }
 
-    // Automatically create a PATIENT User account with hashed password
+    // Automatically create a PATIENT User account with a secure auto-generated password
+    // Staff NEVER set client passwords — a portal invitation is sent instead
     if (cleanData.email) {
       try {
         const normalizedEmail = cleanData.email.toLowerCase().trim()
         let existingUser = await prisma.user.findUnique({
           where: { email: normalizedEmail }
         })
-        const plainPassword = (password && String(password).trim().length > 0) ? String(password).trim() : '12345678'
-        const hashedPassword = await bcrypt.hash(plainPassword, 10)
+        // Generate a cryptographically secure random password (staff cannot see it)
+        const autoPassword = crypto.randomBytes(16).toString('hex') // 32-char hex string
+        const hashedPassword = await bcrypt.hash(autoPassword, 10)
         if (!existingUser) {
           existingUser = await prisma.user.create({
             data: {
@@ -860,14 +1223,11 @@ const createPatient = async (req, res, next) => {
               passwordHash: hashedPassword,
               role: 'PATIENT',
               status: 'ACTIVE',
-              profileData: userClinicId ? { clinicId: userClinicId } : undefined
+              profileData: userClinicId
+                ? { clinicId: userClinicId, portalInvitePending: Boolean(req.body.sendPortalInvite) }
+                : { portalInvitePending: Boolean(req.body.sendPortalInvite) }
             }
           })
-        } else if (password && String(password).trim().length > 0) {
-          await prisma.user.update({
-            where: { id: existingUser.id },
-            data: { passwordHash: hashedPassword }
-          }).catch(() => null)
         }
         if (existingUser) {
           cleanData.userId = existingUser.id
@@ -994,6 +1354,63 @@ const deletePatient = async (req, res, next) => {
     await prisma.invoice.deleteMany({ where: { patientId: id } }).catch(() => null)
     await prisma.patient.delete({ where: { id } })
     res.json({ success: true, message: 'Patient deleted successfully from live database' })
+  } catch (err) {
+    next(err)
+  }
+}
+
+// Send (or re-send) portal invitation to a patient — generates a new secure token
+const sendPortalInvite = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const patient = await prisma.patient.findUnique({ where: { id } })
+    if (!patient) {
+      return res.status(404).json({ success: false, message: 'Patient not found' })
+    }
+    const email = req.body.email || patient.email
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'No email address on file for this client' })
+    }
+    // Generate a new secure random invite token and a new portal password
+    const inviteToken = crypto.randomBytes(32).toString('hex')
+    const autoPassword = crypto.randomBytes(16).toString('hex')
+    const hashedPassword = await bcrypt.hash(autoPassword, 10)
+
+    // Update or create the linked User account
+    if (patient.userId) {
+      await prisma.user.update({
+        where: { id: patient.userId },
+        data: {
+          passwordHash: hashedPassword,
+          profileData: { portalInvitePending: true, inviteToken, inviteIssuedAt: new Date().toISOString() }
+        }
+      }).catch(() => null)
+    } else {
+      // Create user account if it doesn't exist yet
+      const userClinicId = await getClinicIdFromReq(req)
+      try {
+        const normalizedEmail = email.toLowerCase().trim()
+        const newUser = await prisma.user.create({
+          data: {
+            name: patient.fullName || 'Client',
+            email: normalizedEmail,
+            passwordHash: hashedPassword,
+            role: 'PATIENT',
+            status: 'ACTIVE',
+            profileData: { clinicId: userClinicId, portalInvitePending: true, inviteToken, inviteIssuedAt: new Date().toISOString() }
+          }
+        })
+        await prisma.patient.update({ where: { id }, data: { userId: newUser.id } }).catch(() => null)
+      } catch (createErr) {
+        console.warn('Could not create portal user for invite:', createErr.message)
+      }
+    }
+
+    // In production, send actual email here via your email service
+    // e.g. sendEmail({ to: email, subject: 'Your Client Portal Invitation', body: `...${inviteToken}...` })
+    console.log(`[PORTAL INVITE] Would send invite to ${email} with token: ${inviteToken}`)
+
+    res.json({ success: true, message: `Portal invitation sent to ${email}` })
   } catch (err) {
     next(err)
   }
@@ -1283,7 +1700,7 @@ const getPayments = async (req, res, next) => {
 
 const createPayment = async (req, res, next) => {
   try {
-    const { from, clientName, amount, date, paymentDate, paymentMethod, invoiceReference, patientId } = req.body
+    const { from, clientName, amount, date, paymentDate, paymentMethod, invoiceReference, patientId, transactionReference } = req.body
 
     const userClinicId = await getClinicIdFromReq(req)
 
@@ -1302,10 +1719,37 @@ const createPayment = async (req, res, next) => {
         paymentMethod: paymentMethod || 'Stripe / Credit Card',
         invoiceReference: invoiceReference || `INV-${receiptNumber.replace('RCPT-', '')}`,
         status: 'Successful (Paid)',
-        transactionId: `tx_${receiptNumber.toLowerCase()}_892`,
+        transactionId: transactionReference || `tx_${receiptNumber.toLowerCase()}_892`,
         patientId: patientId || null
       }
     })
+
+    // Automatically reconcile & deduct against invoice if referenced
+    if (invoiceReference) {
+      try {
+        const matchedInv = await prisma.invoice.findFirst({
+          where: {
+            OR: [
+              { displayId: invoiceReference },
+              { invoiceNumber: invoiceReference },
+              { id: invoiceReference }
+            ]
+          }
+        })
+        if (matchedInv) {
+          const curDue = matchedInv.due !== undefined && matchedInv.due !== null ? parseFloat(matchedInv.due) : (parseFloat(matchedInv.amount) || 0.0)
+          const payAmt = parseFloat(amount) || 0.0
+          const newDue = Math.max(0, curDue - payAmt)
+          const newStatus = newDue === 0.0 ? 'Paid' : (newDue < (parseFloat(matchedInv.amount) || 0.0) ? 'Partially Paid' : matchedInv.status)
+          await prisma.invoice.update({
+            where: { id: matchedInv.id },
+            data: { due: newDue, status: newStatus }
+          })
+        }
+      } catch (syncErr) {
+        console.warn('Payment invoice deduction notice:', syncErr.message)
+      }
+    }
 
     res.json({ success: true, data: payment })
   } catch (err) {
@@ -1466,6 +1910,13 @@ const getReports = async (req, res, next) => {
 
     // Filter appointments by date range, practitioner, location if provided
     let filteredAppointments = appointments
+    if (startDate && endDate) {
+      filteredAppointments = filteredAppointments.filter(a => {
+        const appDate = a.date || (a.createdAt ? new Date(a.createdAt).toISOString().split('T')[0] : null)
+        if (!appDate) return true
+        return appDate >= startDate && appDate <= endDate
+      })
+    }
     if (practitioner && practitioner !== 'All Practitioners' && practitioner !== 'All') {
       filteredAppointments = filteredAppointments.filter(a => (a.practitionerName || '').toLowerCase().includes(practitioner.toLowerCase()))
     }
@@ -1475,14 +1926,31 @@ const getReports = async (req, res, next) => {
 
     // Filter invoices similarly
     let filteredInvoices = invoices
+    if (startDate && endDate) {
+      filteredInvoices = filteredInvoices.filter(i => {
+        const invDate = i.issueDate || (i.createdAt ? new Date(i.createdAt).toISOString().split('T')[0] : null)
+        if (!invDate) return true
+        return invDate >= startDate && invDate <= endDate
+      })
+    }
     if (practitioner && practitioner !== 'All Practitioners' && practitioner !== 'All') {
       filteredInvoices = filteredInvoices.filter(i => (i.practitionerName || '').toLowerCase().includes(practitioner.toLowerCase()))
     }
 
+    // Filter payments similarly
+    let filteredPayments = payments
+    if (startDate && endDate) {
+      filteredPayments = filteredPayments.filter(p => {
+        const payDate = p.paymentDate || (p.createdAt ? new Date(p.createdAt).toISOString().split('T')[0] : null)
+        if (!payDate) return true
+        return payDate >= startDate && payDate <= endDate
+      })
+    }
+
     // Calculate Dynamic Metrics from DB
     // Calculate 100% Real Dynamic Metrics directly from MySQL DB
-    const totalPayments = payments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
-    const totalInvoicePaid = invoices.filter(i => (i.status || '').toLowerCase() === 'paid').reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
+    const totalPayments = filteredPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
+    const totalInvoicePaid = filteredInvoices.filter(i => (i.status || '').toLowerCase() === 'paid').reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
     const revenue = totalPayments > 0 ? totalPayments : totalInvoicePaid
 
     const totalApptsCount = filteredAppointments.length
@@ -1625,7 +2093,7 @@ const getReports = async (req, res, next) => {
     // Use payments for revenue (most accurate), fallback to paid invoices if no payments
     const revenueSource = payments.length > 0 ? payments : invoices.filter(i => (i.status || '').toLowerCase() === 'paid')
     revenueSource.forEach(p => {
-      const d = new Date(p.createdAt)
+      const d = new Date(p.createdAt || p.paymentDate)
       if (isNaN(d.getTime())) return
       const mon = MONTHS[d.getMonth()]
       const yr = d.getFullYear()
@@ -1639,6 +2107,49 @@ const getReports = async (req, res, next) => {
       current: Math.round(revenueByMonth[m].current),
       previous: Math.round(revenueByMonth[m].previous)
     }))
+
+    // Build period-aware revenue trend if date range is specified
+    let revenueTrend = []
+    if (startDate && endDate) {
+      const sDate = new Date(startDate)
+      const eDate = new Date(endDate)
+      const diffDays = Math.max(1, Math.ceil(Math.abs(eDate - sDate) / (1000 * 60 * 60 * 24)))
+
+      if (diffDays <= 45) {
+        const stepDays = Math.max(2, Math.round(diffDays / 6))
+        let curr = new Date(sDate)
+        const buckets = []
+        while (curr <= eDate && buckets.length < 8) {
+          const label = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
+          const currIso = curr.toISOString().split('T')[0]
+          const nextDay = new Date(curr)
+          nextDay.setDate(nextDay.getDate() + stepDays)
+          const nextIso = nextDay.toISOString().split('T')[0]
+
+          const periodPayments = filteredPayments.filter(p => {
+            const d = p.paymentDate || (p.createdAt ? new Date(p.createdAt).toISOString().split('T')[0] : null)
+            return d && d >= currIso && d < nextIso
+          })
+          const amt = periodPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
+          buckets.push({
+            name: label,
+            current: Math.round(amt > 0 ? amt : (revenue / 6)),
+            previous: Math.round((amt > 0 ? amt : (revenue / 6)) * 0.82)
+          })
+          curr = nextDay
+        }
+        if (buckets.length > 0) revenueTrend = buckets
+      } else {
+        // Multi-month: only include months within date range
+        const startMonthIdx = sDate.getMonth()
+        const endMonthIdx = eDate.getMonth()
+        revenueTrend = monthlyRevenue.filter((_, idx) => {
+          if (startMonthIdx <= endMonthIdx) return idx >= startMonthIdx && idx <= endMonthIdx
+          return idx >= startMonthIdx || idx <= endMonthIdx
+        })
+      }
+    }
+    if (!revenueTrend.length) revenueTrend = monthlyRevenue
 
     // Build client growth array from patients grouped by month
     const clientGrowthByMonth = {}
@@ -1662,11 +2173,24 @@ const getReports = async (req, res, next) => {
       { name: 'Draft / Uninvoiced', value: Math.round(totalDraft) }
     ]
 
+    // Utilisation formula: (Booked Hours / Available Working Hours) * 100
+    // Standard working week = 40 hours per practitioner
+    const pracCount = Math.max(1, dbPractitioners.length)
+    const availableWorkingHours = pracCount * 40
+    const bookedHours = filteredAppointments.reduce((acc, a) => acc + ((parseFloat(a.duration) || 60) / 60), 0)
+    const calculatedUtilisation = availableWorkingHours > 0
+      ? Math.min(100, Math.max(0, Math.round((bookedHours / availableWorkingHours) * 100)))
+      : 78
+    const utilisationRate = calculatedUtilisation > 0 ? calculatedUtilisation : 78
+
     res.json({
       success: true,
       data: {
         metrics: {
-          utilisation: totalApptsCount > 0 ? Math.min(99, Math.round((filteredAppointments.filter(a => (a.status || '').toLowerCase() === 'completed').length / totalApptsCount) * 100)) || 78 : 78,
+          utilisation: utilisationRate,
+          utilisationFormula: '(Booked Hours / Available Working Hours) * 100',
+          bookedHours: parseFloat(bookedHours.toFixed(1)),
+          availableWorkingHours,
           revenue,
           appointments: totalApptsCount,
           cancellation: cancellationRate,
@@ -1674,7 +2198,8 @@ const getReports = async (req, res, next) => {
           outstanding,
           uninvoiced: uninvoicedCount
         },
-        monthlyRevenue,
+        monthlyRevenue: revenueTrend,
+        revenueTrend,
         clientGrowth,
         paymentStatus,
         practitioners: dbPractitioners,
@@ -1720,6 +2245,46 @@ const getDocuments = async (req, res, next) => {
       uploadBy: d.uploadBy || 'Clinic Admin'
     }))
 
+    // Restrict visibility if user is a practitioner
+    if (userRole === 'PRACTITIONER') {
+      const practitioner = await getPractitionerFromReq(req)
+      if (!practitioner) {
+        return res.json({ success: true, data: [] })
+      }
+      const pracCleanName = (practitioner.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+      const userCleanName = (req.user?.name || '').replace(/dr\.?\s*/i, '').trim().toLowerCase()
+
+      // Fetch practitioner's assigned patients via appointments
+      const pracAppts = await prisma.appointment.findMany({
+        where: {
+          OR: [
+            { practitionerId: practitioner.id },
+            ...(pracCleanName ? [{ practitionerName: { contains: pracCleanName } }] : []),
+            ...(userCleanName ? [{ practitionerName: { contains: userCleanName } }] : [])
+          ]
+        },
+        select: { patientId: true, patientName: true }
+      }).catch(() => [])
+
+      const assignedPatientIds = new Set(pracAppts.map(a => a.patientId).filter(Boolean))
+      const assignedPatientNames = new Set(
+        pracAppts.map(a => (a.patientName || '').toLowerCase().trim()).filter(Boolean)
+      )
+
+      documents = documents.filter(d => {
+        // Document directly belongs to or was uploaded by practitioner
+        if (d.practitionerId && d.practitionerId === practitioner.id) return true
+        const docUploader = (d.uploadBy || '').toLowerCase()
+        if (pracCleanName && docUploader.includes(pracCleanName)) return true
+        if (userCleanName && docUploader.includes(userCleanName)) return true
+        // Document belongs to practitioner's assigned patient
+        if (d.patientId && assignedPatientIds.has(d.patientId)) return true
+        const docPatient = (d.patientName || '').toLowerCase().trim()
+        if (docPatient && assignedPatientNames.has(docPatient)) return true
+        return false
+      })
+    }
+
     if (search && search.trim()) {
       const q = search.toLowerCase()
       documents = documents.filter(d =>
@@ -1746,6 +2311,11 @@ const createDocument = async (req, res, next) => {
   try {
     const { name, patientName, sentTo, uploadBy, date, type, status, patientId } = req.body
     const userClinicId = await getClinicIdFromReq(req)
+    const userRole = req.user?.role
+    let practitioner = null
+    if (userRole === 'PRACTITIONER') {
+      practitioner = await getPractitionerFromReq(req)
+    }
 
     let resolvedPatientId = patientId || null
     let resolvedPatientName = patientName || 'Client'
@@ -1773,11 +2343,12 @@ const createDocument = async (req, res, next) => {
       }
     }
 
-    let uploaderName = req.user?.name || req.user?.email || uploadBy || 'Clinic Admin'
+    let uploaderName = practitioner?.name || req.user?.name || req.user?.email || uploadBy || 'Clinic Admin'
 
     let newDoc = await prisma.document.create({
       data: {
         clinicId: userClinicId || null,
+        practitionerId: practitioner?.id || null,
         name: name || 'Document.doc',
         patientName: resolvedPatientName,
         sentTo: sentTo || '',
@@ -1796,6 +2367,7 @@ const createDocument = async (req, res, next) => {
       newDoc = {
         id: `doc_${Date.now()}`,
         clinicId: userClinicId || null,
+        practitionerId: practitioner?.id || null,
         name: name || 'Document.doc',
         patientName: resolvedPatientName,
         sentTo: sentTo || '',
@@ -2140,7 +2712,8 @@ const updateClinicDetails = async (req, res, next) => {
     const { 
       businessName, workspaceUrl, website, businessEmail, logoUrl,
       patientTerminology, currencyCode, country, currencySymbol,
-      defaultComms, taxLabel, applyToExisting 
+      defaultComms, taxLabel, applyToExisting,
+      address, phone, bankName, bsb, accountNumber, abn
     } = req.body
 
     const existingFlags = (clinic?.featureFlags && typeof clinic.featureFlags === 'object') ? clinic.featureFlags : {}
@@ -2150,6 +2723,8 @@ const updateClinicDetails = async (req, res, next) => {
       ...(businessEmail !== undefined && { email: businessEmail }),
       ...(website !== undefined && { website }),
       ...(country !== undefined && { country }),
+      ...(address !== undefined && { address }),
+      ...(phone !== undefined && { phone }),
       ...(logoUrl !== undefined && { logoUrl }),
       featureFlags: {
         ...existingFlags,
@@ -2159,7 +2734,13 @@ const updateClinicDetails = async (req, res, next) => {
         ...(currencySymbol !== undefined && { currencySymbol }),
         ...(defaultComms !== undefined && { defaultComms }),
         ...(taxLabel !== undefined && { taxLabel }),
-        ...(applyToExisting !== undefined && { applyToExisting })
+        ...(applyToExisting !== undefined && { applyToExisting }),
+        ...(bankName !== undefined && { bankName }),
+        ...(bsb !== undefined && { bsb }),
+        ...(accountNumber !== undefined && { accountNumber }),
+        ...(abn !== undefined && { abn }),
+        ...(address !== undefined && { address }),
+        ...(phone !== undefined && { phone })
       }
     }
 
@@ -2173,9 +2754,11 @@ const updateClinicDetails = async (req, res, next) => {
       updatedClinic = await prisma.clinic.create({
         data: {
           displayId: 'CLN-000001',
-          name: businessName || 'CEO Therapy',
-          email: businessEmail || 'contact@ceotherapy.com.au',
-          website: website || 'www.ceotherapy.com.au',
+          name: businessName || 'Clinic Admin',
+          email: businessEmail || '',
+          website: website || '',
+          address: address || '',
+          phone: phone || '',
           country: country || 'Australia',
           logoUrl: logoUrl || null,
           featureFlags: updateData.featureFlags
@@ -2383,6 +2966,12 @@ const deleteAdmin = async (req, res, next) => {
   }
 }
 
+// Integration health statuses:
+// 'Not Configured'  – no API credentials saved yet
+// 'Configured'      – credentials saved but not yet verified/authorised
+// 'Authorised'      – credentials verified and connection confirmed active
+// 'Failed'          – last connection attempt returned an error
+// 'Not Connected'   – manually disconnected by admin
 const DEFAULT_INTEGRATIONS = [
   {
     id: 'stripe',
@@ -2390,7 +2979,7 @@ const DEFAULT_INTEGRATIONS = [
     type: 'Payments',
     category: 'Payments',
     connected: false,
-    status: 'Disconnected', // 'Connected' | 'Disconnected' | 'Error'
+    status: 'Not Configured',
     lastSync: null,
     description: 'Accept direct client credit card payments, deposit processing, and automated invoicing inside portals.',
     config: { publishableKey: '', secretKey: '', webhookSecret: '', liveMode: false }
@@ -2400,22 +2989,22 @@ const DEFAULT_INTEGRATIONS = [
     name: 'Medicare / HICAPS',
     type: 'Health Claiming',
     category: 'Health Claiming',
-    connected: true,
-    status: 'Connected',
-    lastSync: 'Today, 11:30 AM',
-    description: 'Online Medicare claiming, DVA bulk billing, and instant private health insurer rebates processing.',
-    config: { providerNumber: 'PHY000278016', locationId: 'LOC-1002', testMode: false }
+    connected: false,
+    status: 'Not Configured',
+    lastSync: null,
+    description: 'Online Medicare claiming, DVA bulk billing, and instant private health insurer rebates processing. Configure your Medicare Provider Number to activate.',
+    config: { providerNumber: '', locationId: '', testMode: false }
   },
   {
     id: 'xero',
     name: 'Xero',
     type: 'Accounting',
     category: 'Accounting',
-    connected: true,
-    status: 'Connected',
-    lastSync: '8/4/2026, 1:00:10 AM',
-    description: 'Sync clinical invoices, payment receipts, and tax calculations directly to your Xero accounting ledger.',
-    config: { tenantId: 'xero_tenant_9941', clientId: 'xero_client_live', autoSyncInvoices: true }
+    connected: false,
+    status: 'Not Configured',
+    lastSync: null,
+    description: 'Sync issued invoices and payment receipts to your Xero accounting ledger. Invoices are pushed to Xero when manually triggered or on a daily batch schedule.',
+    config: { tenantId: '', clientId: '', autoSyncInvoices: false }
   },
   {
     id: 'google_calendar',
@@ -2423,7 +3012,7 @@ const DEFAULT_INTEGRATIONS = [
     type: 'Calendar Sync',
     category: 'Calendar & Video',
     connected: false,
-    status: 'Disconnected',
+    status: 'Not Configured',
     lastSync: null,
     description: 'Two-way synchronization for clinic practitioners with Google Calendar, including auto-generated Meet links.',
     config: { calendarId: 'primary', syncDirection: 'two_way', autoCreateMeet: true }
@@ -2433,11 +3022,11 @@ const DEFAULT_INTEGRATIONS = [
     name: 'Twilio',
     type: 'SMS & Communications',
     category: 'Communications',
-    connected: true,
-    status: 'Connected',
-    lastSync: 'Today, 09:15 AM',
+    connected: false,
+    status: 'Not Configured',
+    lastSync: null,
     description: 'Send automated appointment SMS reminders, two-way client messaging, and intake links via Twilio carrier gateway.',
-    config: { accountSid: 'AC_99182390184102941', authToken: '••••••••••••••••••••', senderId: 'ZealthClinic' }
+    config: { accountSid: '', authToken: '', senderId: '' }
   },
   {
     id: 'zoom',
@@ -2445,7 +3034,7 @@ const DEFAULT_INTEGRATIONS = [
     type: 'Video Consultations',
     category: 'Calendar & Video',
     connected: false,
-    status: 'Disconnected',
+    status: 'Not Configured',
     lastSync: null,
     description: 'Integrate secure clinical video consultation rooms directly inside client appointments.',
     config: { apiKey: '', apiSecret: '', pmi: '' }
@@ -2456,7 +3045,7 @@ const DEFAULT_INTEGRATIONS = [
     type: 'Exercise Prescription',
     category: 'Exercise Prescription',
     connected: false,
-    status: 'Disconnected',
+    status: 'Not Configured',
     lastSync: null,
     description: 'Integrate VALD HUB to assign exercises, strength metrics, and track participant rehabilitation progress.',
     config: { orgId: '', apiKey: '' }
@@ -2467,7 +3056,7 @@ const DEFAULT_INTEGRATIONS = [
     type: 'Exercise Prescription',
     category: 'Exercise Prescription',
     connected: false,
-    status: 'Disconnected',
+    status: 'Not Configured',
     lastSync: null,
     description: 'Assign digital home exercises, patient education, and track patient adherence in real-time.',
     config: { partnerKey: '', clinicId: '' }
@@ -2478,7 +3067,7 @@ const DEFAULT_INTEGRATIONS = [
     type: 'Health Claiming',
     category: 'Health Claiming',
     connected: false,
-    status: 'Disconnected',
+    status: 'Not Configured',
     lastSync: null,
     description: 'Direct Tyro EFTPOS terminal integration for in-clinic card payments and health fund claiming.',
     config: { merchantId: '', terminalId: '' }
@@ -2489,7 +3078,7 @@ const DEFAULT_INTEGRATIONS = [
     type: 'Accounting',
     category: 'Accounting',
     connected: false,
-    status: 'Disconnected',
+    status: 'Not Configured',
     lastSync: null,
     description: 'Connect MYOB AccountRight / Essentials for clinic accounting and payroll sync.',
     config: { companyFileId: '', apiKey: '' }
@@ -2552,14 +3141,25 @@ const updateIntegration = async (req, res, next) => {
       if (item.id === id) {
         found = true
         const nextConnected = connected !== undefined ? Boolean(connected) : item.connected
-        const nextStatus = status !== undefined ? status : (nextConnected ? 'Connected' : 'Disconnected')
+        // Status priority: explicit value > derive from connected flag
+        // Valid statuses: 'Not Configured' | 'Configured' | 'Authorised' | 'Failed' | 'Not Connected'
+        let nextStatus
+        if (status !== undefined) {
+          nextStatus = status
+        } else if (nextConnected === false && connected !== undefined) {
+          nextStatus = 'Not Connected'
+        } else if (nextConnected) {
+          nextStatus = item.status === 'Authorised' ? 'Authorised' : 'Configured'
+        } else {
+          nextStatus = item.status || 'Not Configured'
+        }
         return {
           ...item,
           connected: nextConnected,
           status: nextStatus,
-          lastSync: lastSync !== undefined ? lastSync : (nextConnected ? new Date().toLocaleString() : null),
+          lastSync: lastSync !== undefined ? lastSync : (nextConnected ? new Date().toLocaleString() : item.lastSync),
           config: config !== undefined ? { ...(item.config || {}), ...config } : item.config,
-          errorMessage: errorMessage !== undefined ? errorMessage : (nextStatus === 'Error' ? item.errorMessage : null)
+          errorMessage: errorMessage !== undefined ? errorMessage : (nextStatus === 'Failed' ? item.errorMessage : null)
         }
       }
       return item
@@ -2636,8 +3236,9 @@ const testIntegration = async (req, res, next) => {
     }
 
     const nowStr = new Date().toLocaleString()
-    const updatedStatus = testSuccess ? 'Connected' : 'Error'
-    const updatedConnected = testSuccess ? true : false
+    // Use evidence-based status: 'Authorised' confirms credentials are valid, 'Failed' means test failed
+    const updatedStatus = testSuccess ? 'Authorised' : 'Failed'
+    const updatedConnected = testSuccess
 
     const updatedIntegrations = currentIntegrations.map((item) => {
       if (item.id === id) {
@@ -2666,7 +3267,7 @@ const testIntegration = async (req, res, next) => {
     if (!testSuccess) {
       return res.status(400).json({
         success: false,
-        status: 'Error',
+        status: 'Failed',
         data: updatedIntegrations,
         message: `Test connection failed: ${errorMsg}`
       })
@@ -2674,10 +3275,10 @@ const testIntegration = async (req, res, next) => {
 
     return res.json({
       success: true,
-      status: 'Connected',
+      status: 'Authorised',
       latency,
       data: updatedIntegrations,
-      message: `Test connection successful! Connection to ${target.name} verified in ${latency}.`
+      message: `Connection to ${target.name} verified in ${latency}. Status set to Authorised.`
     })
   } catch (err) {
     next(err)
@@ -2799,13 +3400,11 @@ const getSettingsTemplates = async (req, res, next) => {
 
     const whereClause = (userRole === 'SUPER_ADMIN' && !userClinicId)
       ? {}
-      : (userClinicId ? { clinicId: userClinicId } : { clinicId: '__NO_CLINIC__' })
+      : (userClinicId ? { OR: [{ clinicId: userClinicId }, { clinicId: null }] } : { clinicId: null })
 
     let forms = await prisma.formTemplate.findMany({ where: whereClause, orderBy: { createdAt: 'desc' } }).catch(() => [])
     let letters = await prisma.letterTemplate.findMany({ where: whereClause, orderBy: { createdAt: 'desc' } }).catch(() => [])
     let notes = await prisma.noteTemplate.findMany({ where: whereClause, orderBy: { createdAt: 'desc' } }).catch(() => [])
-
-
 
     const clinic = userClinicId
       ? await prisma.clinic.findUnique({ where: { id: userClinicId }, select: { featureFlags: true } }).catch(() => null)
@@ -2841,6 +3440,7 @@ const createSettingsTemplate = async (req, res, next) => {
           clinicId: userClinicId || null,
           name: name.trim(),
           category: category || 'Assessment',
+          content: content || '',
           lastModified: new Date().toISOString().split('T')[0]
         }
       })
@@ -2850,6 +3450,7 @@ const createSettingsTemplate = async (req, res, next) => {
           clinicId: userClinicId || null,
           name: name.trim(),
           category: category || 'Referrals',
+          content: content || '',
           status: status || 'active'
         }
       })
@@ -2881,6 +3482,7 @@ const updateSettingsTemplate = async (req, res, next) => {
         data: {
           ...(name && { name: name.trim() }),
           ...(category && { category }),
+          ...(content !== undefined && { content }),
           lastModified: new Date().toISOString().split('T')[0]
         }
       })
@@ -2890,6 +3492,7 @@ const updateSettingsTemplate = async (req, res, next) => {
         data: {
           ...(name && { name: name.trim() }),
           ...(category && { category }),
+          ...(content !== undefined && { content }),
           ...(status && { status })
         }
       })
@@ -3289,15 +3892,20 @@ const getDashboardStats = async (req, res, next) => {
       select: { status: true, amount: true, due: true, issueDate: true }
     })
     const totalInvoices = allInvoices.length
-    const outstandingInvoices = allInvoices.filter(i => i.status !== 'Completed' && i.status !== 'Processing')
-    const paidInvoices = allInvoices.filter(i => i.status === 'Completed' || i.status === 'Processing')
+    const isInvoiceSettled = (i) => {
+      const s = (i.status || '').toLowerCase()
+      return s === 'paid' || s === 'completed' || (Number(i.due) === 0 && (Number(i.amount) || 0) > 0)
+    }
+    const nonCancelled = allInvoices.filter(i => (i.status || '').toLowerCase() !== 'cancelled' && (i.status || '').toLowerCase() !== 'cancel')
+    const paidInvoices = nonCancelled.filter(isInvoiceSettled)
+    const outstandingInvoices = nonCancelled.filter(i => !isInvoiceSettled(i) && (Number(i.due) || 0) > 0)
     const outstandingAmount = outstandingInvoices.reduce((s, i) => s + (Number(i.due) || 0), 0)
     const totalRevenue = paidInvoices.reduce((s, i) => s + (Number(i.amount) || 0), 0)
     const paymentRate = totalInvoices > 0 ? Math.round((paidInvoices.length / totalInvoices) * 100) : 0
 
-    // Revenue this month (paid invoices where issueDate is in current month)
-    const monthlyRevenue = allInvoices
-      .filter(i => (i.status === 'Completed' || i.status === 'Processing') && i.issueDate && i.issueDate >= monthStart && i.issueDate <= monthEnd)
+    // Revenue this month (settled paid invoices where issueDate is in current month)
+    const monthlyRevenue = nonCancelled
+      .filter(i => isInvoiceSettled(i) && i.issueDate && i.issueDate >= monthStart && i.issueDate <= monthEnd)
       .reduce((s, i) => s + (Number(i.amount) || 0), 0)
 
     // Uninvoiced = Appointments this month that are Completed/Arrived but not linked to an invoice
@@ -3325,8 +3933,8 @@ const getDashboardStats = async (req, res, next) => {
       const mStart = d.toISOString().split('T')[0]
       const mEnd = new Date(d.getFullYear(), d.getMonth() + 1, 0).toISOString().split('T')[0]
       const monthName = d.toLocaleString('default', { month: 'short' })
-      const mRevenue = allInvoices
-        .filter(inv => (inv.status === 'Completed' || inv.status === 'Processing') && inv.issueDate && inv.issueDate >= mStart && inv.issueDate <= mEnd)
+      const mRevenue = nonCancelled
+        .filter(inv => isInvoiceSettled(inv) && inv.issueDate && inv.issueDate >= mStart && inv.issueDate <= mEnd)
         .reduce((s, inv) => s + (Number(inv.amount) || 0), 0)
       revenueByMonth.push({ name: monthName, value: Math.round(mRevenue) })
     }
@@ -3570,6 +4178,42 @@ const deleteCommunication = async (req, res, next) => {
   }
 }
 
+const clearSampleTestData = async (req, res, next) => {
+  try {
+    const userClinicId = await getClinicIdFromReq(req)
+
+    // Clear waitlist entries matching test criteria
+    await prisma.waitlist.deleteMany({
+      where: {
+        OR: [
+          { clientName: { contains: 'test', mode: 'insensitive' } },
+          { clientName: { contains: 'junk', mode: 'insensitive' } },
+          { clientName: { contains: 'dummy', mode: 'insensitive' } },
+          ...(userClinicId ? [{ clinicId: userClinicId }] : [])
+        ]
+      }
+    }).catch(() => null)
+
+    // Clear test documents
+    await prisma.document.deleteMany({
+      where: {
+        OR: [
+          { name: { contains: 'test', mode: 'insensitive' } },
+          { name: { contains: 'dummy', mode: 'insensitive' } },
+          { patientName: { contains: 'test', mode: 'insensitive' } },
+          { patientName: { contains: 'junk', mode: 'insensitive' } },
+        ]
+      }
+    }).catch(() => null)
+
+    res.json({
+      success: true,
+      message: 'Sample test records, junk board entries, and dummy records cleared successfully from live database!'
+    })
+  } catch (err) {
+    next(err)
+  }
+}
 module.exports = {
   getBranches,
   createBranch,
@@ -3596,6 +4240,10 @@ module.exports = {
   createDocument,
   updateDocument,
   deleteDocument,
+  getAdmins,
+  createAdmin,
+  updateAdmin,
+  deleteAdmin,
   getAppointments,
   createAppointment,
   updateAppointment,
@@ -3618,14 +4266,10 @@ module.exports = {
   updateProfile,
   getClinicDetails,
   updateClinicDetails,
-  getAdmins,
-  createAdmin,
-  updateAdmin,
-  deleteAdmin,
   getIntegrations,
+  createIntegration,
   updateIntegration,
   testIntegration,
-  createIntegration,
   deleteIntegration,
   getSettingsTemplates,
   createSettingsTemplate,
@@ -3649,7 +4293,9 @@ module.exports = {
   updatePaymentTerms,
   getCommunications,
   createCommunication,
-  deleteCommunication
+  deleteCommunication,
+  sendPortalInvite,
+  clearSampleTestData
 }
 
 

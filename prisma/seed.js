@@ -89,13 +89,13 @@ async function main() {
   // 5. Seed Patient User & Profile
   const patientUser = await prisma.user.upsert({
     where: { email: 'patient@zhealth.com' },
-    update: { displayId: 'USR-000002' },
+    update: { displayId: 'PAT-000001' },
     create: {
-      displayId: 'USR-000002',
+      displayId: 'PAT-000001',
       email: 'patient@zhealth.com',
       passwordHash: defaultPasswordHash,
-      name: 'John Doe',
-      phone: '+61 400 999 888',
+      name: 'Oliver Vance',
+      phone: '+61 412 888 999',
       role: 'PATIENT',
       status: 'ACTIVE',
     },
@@ -107,61 +107,90 @@ async function main() {
     create: {
       displayId: 'PAT-000001',
       userId: patientUser.id,
-      fullName: 'John Doe',
-      dob: '1990-05-15',
+      fullName: 'Oliver Vance',
+      dob: '1988-03-24',
       gender: 'Male',
       email: 'patient@zhealth.com',
-      phone: '+61 400 999 888',
-      address: '123 Main St',
+      phone: '+61 412 888 999',
+      address: '45 Collins Street',
       city: 'Melbourne',
       state: 'VIC',
       postcode: '3000',
-      sessionsAllocated: 10,
-      sessionsUsed: 2,
+      sessionsAllocated: 12,
+      sessionsUsed: 3,
       status: 'active',
+      diagnosis: ['Rotator Cuff Tendinopathy', 'Postural Kyphosis'],
+      notes: 'NDIS Plan Managed - Progressing well with upper limb resistance rehab.'
     },
   })
 
   // 6. Seed Branches
   const b1 = await prisma.branch.create({
     data: {
-      name: 'Melbourne Central Clinic',
+      name: 'Melbourne Central Allied Clinic',
       email: 'melbourne@zhealth.com',
       phone: '+61 3 9000 1111',
-      address: '123 Care Street, Melbourne VIC',
+      address: '123 Care Street, Melbourne VIC 3000',
       status: 'Active',
     },
   }).catch(() => null)
 
-  // 7. Seed Sample Appointments
+  // 7. Seed Realistic Appointments
   await prisma.appointment.createMany({
     data: [
       {
         displayId: 'APT-000001',
-        patientName: 'John Doe',
+        patientName: 'Oliver Vance',
         practitionerName: 'Dr. Sarah Jenkins',
-        branchName: 'Melbourne Central Clinic',
+        branchName: 'Melbourne Central Allied Clinic',
         serviceName: 'Physiotherapy Initial Consultation',
         date: new Date().toISOString().split('T')[0],
-        startTime: '10:00 AM',
-        endTime: '10:45 AM',
+        startTime: '09:00',
+        endTime: '10:00',
         status: 'Scheduled',
         fee: 180,
+        location: 'Melbourne Central Allied Clinic',
+        room: 'Room 1'
       },
+      {
+        displayId: 'APT-000002',
+        patientName: 'Emily Taylor',
+        practitionerName: 'Dr. Sarah Jenkins',
+        branchName: 'Melbourne Central Allied Clinic',
+        serviceName: 'Occupational Therapy Review',
+        date: new Date().toISOString().split('T')[0],
+        startTime: '11:00',
+        endTime: '12:00',
+        status: 'Completed',
+        fee: 195,
+        location: 'Melbourne Central Allied Clinic',
+        room: 'Room 2'
+      }
     ],
     skipDuplicates: true,
   })
 
-  // 8. Seed Sample Waitlist
+  // 8. Seed Realistic Waitlist Entries
   await prisma.waitlist.createMany({
     data: [
       {
-        clientName: 'Alice Smith',
+        clientName: 'Charlotte Hughes',
         contactNumber: '+61 411 222 333',
         preferredPractitioner: 'Dr. Sarah Jenkins',
         appointmentType: 'Initial Assessment',
+        preferredDate: new Date().toISOString().split('T')[0],
         status: 'Waiting',
+        branch: 'Melbourne Central Allied Clinic'
       },
+      {
+        clientName: 'Liam Patterson',
+        contactNumber: '+61 414 555 777',
+        preferredPractitioner: 'Dr. Sarah Jenkins',
+        appointmentType: 'Hydrotherapy Session',
+        preferredDate: new Date().toISOString().split('T')[0],
+        status: 'Waiting',
+        branch: 'Melbourne Central Allied Clinic'
+      }
     ],
     skipDuplicates: true,
   })

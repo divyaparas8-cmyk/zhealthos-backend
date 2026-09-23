@@ -483,6 +483,7 @@ model FormTemplate {
   clinicId     String?
   name         String
   category     String   @default("Assessment")
+  content      String?  @db.Text
   lastModified String
   createdAt    DateTime @default(now())
 
@@ -494,6 +495,7 @@ model LetterTemplate {
   clinicId  String?
   name      String
   category  String   @default("Referrals")
+  content   String?  @db.Text
   status    String   @default("active")
   createdAt DateTime @default(now())
 

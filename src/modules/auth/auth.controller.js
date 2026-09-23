@@ -160,13 +160,16 @@ const logout = async (req, res, next) => {
 
 const register = async (req, res, next) => {
   try {
-    const { organization, fullName, email, password } = req.body
+    const { organization, fullName, email, password, plan, billingCycle, amount } = req.body
 
     if (!organization || !fullName || !email || !password) {
       return res.status(400).json({ success: false, message: 'All fields (Organization, Full Name, Email, Password) are required.' })
     }
 
     const cleanEmail = email.toLowerCase().trim()
+    const chosenPlan = plan ? plan.trim() : 'Basic'
+    const chosenCycle = billingCycle || 'Monthly'
+    const chosenAmount = typeof amount === 'number' ? amount : (parseFloat(amount) || 0.0)
 
     // 1. Check if user with email already exists
     const existingUser = await prisma.user.findUnique({
@@ -186,7 +189,7 @@ const register = async (req, res, next) => {
         name: organization.trim(),
         email: cleanEmail,
         contactPerson: fullName.trim(),
-        tier: 'Basic',
+        tier: chosenPlan,
         status: 'Active',
         staffCount: 1,
         patientsCount: 0,
@@ -229,10 +232,10 @@ const register = async (req, res, next) => {
       data: {
         clinicId: clinic.id,
         clinicName: clinic.name,
-        plan: 'Basic Tier',
+        plan: chosenPlan.toLowerCase().includes('tier') || chosenPlan.toLowerCase().includes('plan') ? chosenPlan : `${chosenPlan} Plan`,
         status: 'Active',
-        amount: 0.0,
-        billingCycle: 'Monthly'
+        amount: chosenAmount,
+        billingCycle: chosenCycle
       }
     }).catch(() => null)
 

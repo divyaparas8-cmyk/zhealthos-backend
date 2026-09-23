@@ -39,4 +39,11 @@ router.get('/message-board', authenticate, superAdminController.getMessageBoardI
 router.post('/message-board', authenticate, superAdminController.createMessageBoardItem)
 router.delete('/message-board/:id', authenticate, superAdminController.deleteMessageBoardItem)
 
+// Master Subscription Plans (public read & dynamic CRUD for landing page and admin)
+router.get('/subscription-plans', superAdminController.getSubscriptionPlans)
+router.post('/subscription-plans', superAdminController.createSubscriptionPlan)
+router.put('/subscription-plans/:id', superAdminController.updateSubscriptionPlan)
+router.delete('/subscription-plans/:id', superAdminController.deleteSubscriptionPlan)
+
 module.exports = router
+
