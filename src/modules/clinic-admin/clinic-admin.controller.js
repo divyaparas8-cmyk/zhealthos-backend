@@ -1886,6 +1886,130 @@ const deleteProduct = async (req, res, next) => {
   }
 }
 
+// Helper to generate period intervals for report aggregation (Daily, Weekly, Monthly, Yearly)
+function generatePeriodIntervals(startDate, endDate, periodStr) {
+  const normPeriod = (periodStr || 'monthly').toLowerCase().trim()
+  const effStartDate = startDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+  const effEndDate = endDate || new Date().toISOString().split('T')[0]
+  const sDate = new Date(effStartDate)
+  const eDate = new Date(effEndDate)
+
+  const intervals = []
+
+  if (normPeriod === 'daily') {
+    let curr = new Date(sDate)
+    while (curr <= eDate) {
+      const currIso = curr.toISOString().split('T')[0]
+      const nextDay = new Date(curr)
+      nextDay.setDate(nextDay.getDate() + 1)
+      const nextIso = nextDay.toISOString().split('T')[0]
+      const label = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
+      const chartLabel = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
+
+      intervals.push({ label, chartLabel, startIso: currIso, endIso: nextIso })
+      curr = nextDay
+      if (intervals.length >= 90) break
+    }
+  } else if (normPeriod === 'weekly') {
+    let curr = new Date(sDate)
+    while (curr <= eDate) {
+      const currIso = curr.toISOString().split('T')[0]
+      const nextWeek = new Date(curr)
+      nextWeek.setDate(nextWeek.getDate() + 7)
+      const nextIso = nextWeek.toISOString().split('T')[0]
+
+      const weekEndDisplay = new Date(nextWeek)
+      weekEndDisplay.setDate(weekEndDisplay.getDate() - 1)
+      const effectiveEnd = weekEndDisplay > eDate ? eDate : weekEndDisplay
+
+      const sStr = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
+      const eStr = effectiveEnd.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
+      const label = currIso === effectiveEnd.toISOString().split('T')[0] ? sStr : `${sStr} – ${eStr}`
+      const chartLabel = currIso === effectiveEnd.toISOString().split('T')[0] ? sStr : `${sStr} – ${effectiveEnd.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}`
+
+      intervals.push({ label, chartLabel, startIso: currIso, endIso: nextIso })
+      curr = nextWeek
+      if (intervals.length >= 52) break
+    }
+  } else if (normPeriod === 'yearly') {
+    const startYear = sDate.getFullYear()
+    const endYear = eDate.getFullYear()
+    for (let yr = startYear; yr <= endYear; yr++) {
+      const yearStart = `${yr}-01-01`
+      const nextYearStart = `${yr + 1}-01-01`
+      const effectiveStartIso = (yr === startYear && effStartDate) ? effStartDate : yearStart
+      const effectiveEndIso = (yr === endYear && effEndDate) ? new Date(new Date(effEndDate).getTime() + 86400000).toISOString().split('T')[0] : nextYearStart
+
+      intervals.push({
+        label: String(yr),
+        chartLabel: String(yr),
+        startIso: effectiveStartIso,
+        endIso: effectiveEndIso
+      })
+    }
+  } else {
+    // Default: 'monthly'
+    let currYear = sDate.getFullYear()
+    let currMonth = sDate.getMonth()
+    const endYear = eDate.getFullYear()
+    const endMonth = eDate.getMonth()
+
+    while (currYear < endYear || (currYear === endYear && currMonth <= endMonth)) {
+      const mDate = new Date(currYear, currMonth, 1)
+      const nextMDate = new Date(currYear, currMonth + 1, 1)
+      const mStartIso = `${currYear}-${String(currMonth + 1).padStart(2, '0')}-01`
+      const nextMStartIso = `${nextMDate.getFullYear()}-${String(nextMDate.getMonth() + 1).padStart(2, '0')}-01`
+
+      const effectiveStartIso = (currYear === sDate.getFullYear() && currMonth === sDate.getMonth() && effStartDate)
+        ? effStartDate
+        : mStartIso
+      const effectiveEndIso = (currYear === endYear && currMonth === endMonth && effEndDate)
+        ? new Date(new Date(effEndDate).getTime() + 86400000).toISOString().split('T')[0]
+        : nextMStartIso
+
+      const label = mDate.toLocaleDateString('en-AU', { month: 'short', year: 'numeric' })
+      const chartLabel = mDate.toLocaleDateString('en-AU', { month: 'short' })
+
+      intervals.push({
+        label,
+        chartLabel,
+        startIso: effectiveStartIso,
+        endIso: effectiveEndIso
+      })
+
+      currMonth++
+      if (currMonth > 11) {
+        currMonth = 0
+        currYear++
+      }
+      if (intervals.length >= 60) break
+    }
+  }
+
+  if (intervals.length === 0) {
+    intervals.push({
+      label: `${effStartDate} – ${effEndDate}`,
+      chartLabel: `${effStartDate} – ${effEndDate}`,
+      startIso: effStartDate,
+      endIso: new Date(new Date(effEndDate).getTime() + 86400000).toISOString().split('T')[0]
+    })
+  }
+
+  return intervals
+}
+
+// Reports & Analytics Management
+const normalizeToIsoDate = (dateVal) => {
+  if (!dateVal) return null
+  if (typeof dateVal === 'string') {
+    const trimmed = dateVal.trim()
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed
+  }
+  const d = new Date(dateVal)
+  if (isNaN(d.getTime())) return null
+  return d.toISOString().split('T')[0]
+}
+
 // Reports & Analytics Management
 const getReports = async (req, res, next) => {
   try {
@@ -1912,7 +2036,7 @@ const getReports = async (req, res, next) => {
     let filteredAppointments = appointments
     if (startDate && endDate) {
       filteredAppointments = filteredAppointments.filter(a => {
-        const appDate = a.date || (a.createdAt ? new Date(a.createdAt).toISOString().split('T')[0] : null)
+        const appDate = normalizeToIsoDate(a.date) || normalizeToIsoDate(a.createdAt)
         if (!appDate) return true
         return appDate >= startDate && appDate <= endDate
       })
@@ -1928,7 +2052,7 @@ const getReports = async (req, res, next) => {
     let filteredInvoices = invoices
     if (startDate && endDate) {
       filteredInvoices = filteredInvoices.filter(i => {
-        const invDate = i.issueDate || (i.createdAt ? new Date(i.createdAt).toISOString().split('T')[0] : null)
+        const invDate = normalizeToIsoDate(i.issueDate) || normalizeToIsoDate(i.createdAt)
         if (!invDate) return true
         return invDate >= startDate && invDate <= endDate
       })
@@ -1937,18 +2061,17 @@ const getReports = async (req, res, next) => {
       filteredInvoices = filteredInvoices.filter(i => (i.practitionerName || '').toLowerCase().includes(practitioner.toLowerCase()))
     }
 
-    // Filter payments similarly
+    // Filter payments similarly with normalized ISO dates
     let filteredPayments = payments
     if (startDate && endDate) {
       filteredPayments = filteredPayments.filter(p => {
-        const payDate = p.paymentDate || (p.createdAt ? new Date(p.createdAt).toISOString().split('T')[0] : null)
+        const payDate = normalizeToIsoDate(p.paymentDate) || normalizeToIsoDate(p.createdAt)
         if (!payDate) return true
         return payDate >= startDate && payDate <= endDate
       })
     }
 
     // Calculate Dynamic Metrics from DB
-    // Calculate 100% Real Dynamic Metrics directly from MySQL DB
     const totalPayments = filteredPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
     const totalInvoicePaid = filteredInvoices.filter(i => (i.status || '').toLowerCase() === 'paid').reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
     const revenue = totalPayments > 0 ? totalPayments : totalInvoicePaid
@@ -1957,8 +2080,24 @@ const getReports = async (req, res, next) => {
     const cancelledCount = filteredAppointments.filter(a => (a.status || '').toLowerCase().includes('cancel')).length
     const cancellationRate = totalApptsCount > 0 ? parseFloat(((cancelledCount / totalApptsCount) * 100).toFixed(1)) : 0
 
+    const isInvoiceSettled = (i) => {
+      const s = (i.status || '').toLowerCase()
+      return s === 'paid' || s === 'completed' || (Number(i.due) === 0 && (Number(i.amount) || 0) > 0)
+    }
+    const isInvoiceCancelled = (i) => {
+      const s = (i.status || '').toLowerCase()
+      return s === 'cancelled' || s === 'cancel'
+    }
+    const getInvoiceDue = (i) => {
+      if (isInvoiceSettled(i) || isInvoiceCancelled(i) || (i.status || '').toLowerCase() === 'draft') return 0
+      if (i.due !== undefined && i.due !== null) return Math.max(0, parseFloat(i.due) || 0)
+      return Math.max(0, parseFloat(i.amount) || 0)
+    }
+
     const newClientsCount = patients.length
-    const outstanding = filteredInvoices.filter(i => (i.status || '').toLowerCase().includes('overdue') || (i.status || '').toLowerCase().includes('unpaid') || (i.status || '').toLowerCase().includes('outstanding')).reduce((acc, i) => acc + (parseFloat(i.due || i.amount) || 0), 0)
+    // Period outstanding: unpaid balance on filtered invoices (respecting date range, practitioner & location)
+    const periodUnsettled = filteredInvoices.filter(i => getInvoiceDue(i) > 0)
+    const outstanding = periodUnsettled.reduce((acc, i) => acc + getInvoiceDue(i), 0)
     const uninvoicedCount = filteredInvoices.filter(i => (i.status || '').toLowerCase() === 'draft').length
 
     // Extract list of practitioners from db
@@ -1973,13 +2112,13 @@ const getReports = async (req, res, next) => {
       ...appointments.map(a => a.location || a.branchName).filter(Boolean)
     ]))
 
-    // Practitioner Performance aggregation directly from DB
+    // Practitioner Performance aggregation directly from DB for filtered period
     const pracMap = {}
     dbPractitioners.forEach(pName => {
       pracMap[pName] = { name: pName, Appointments: 0, Revenue: 0 }
     })
 
-    appointments.forEach(app => {
+    filteredAppointments.forEach(app => {
       const pName = app.practitionerName || (dbPractitioners.length > 0 ? dbPractitioners[0] : 'Practitioner')
       if (!pracMap[pName]) pracMap[pName] = { name: pName, Appointments: 0, Revenue: 0 }
       pracMap[pName].Appointments += 1
@@ -1991,16 +2130,19 @@ const getReports = async (req, res, next) => {
     // Dynamic Reports Table Headers & Rows mapping based on selected reportType directly from MySQL DB
     let dynamicTable = null
 
+    // Generate dynamic intervals for the selected period (Daily, Weekly, Monthly, Yearly)
+    const intervals = generatePeriodIntervals(startDate, endDate, period)
+
     switch (reportType) {
       case 'invoices_ledger':
         dynamicTable = {
           headers: ['Invoice #', 'Invoice Date', 'Client Name', 'Practitioner', 'Amount ($)', 'Status'],
-          rows: invoices.map(i => ({
+          rows: filteredInvoices.map(i => ({
             inv: i.displayId || i.invoiceNumber || `INV-${(i.id || '').substring(0, 4)}`,
             date: i.issueDate || (i.createdAt ? new Date(i.createdAt).toISOString().split('T')[0] : '—'),
             client: i.clientName || i.patientName || 'Client',
             prac: i.practitionerName || '—',
-            amount: `$${(parseFloat(i.amount) || 0).toLocaleString()}`,
+            amount: `$${(parseFloat(i.amount) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
             status: i.status || 'Paid'
           }))
         }
@@ -2012,24 +2154,26 @@ const getReports = async (req, res, next) => {
           rows: practitionerPerformance.map(p => ({
             name: p.name,
             appts: p.Appointments,
-            revenue: `$${(p.Revenue || 0).toLocaleString()}`,
-            avg: `$${p.Appointments ? Math.round(p.Revenue / p.Appointments) : 0}`
+            revenue: `$${(p.Revenue || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+            avg: `$${p.Appointments ? (p.Revenue / p.Appointments).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '0.00'}`
           }))
         }
         break
 
-      case 'outstanding_bal':
-        const unpaidInvoices = invoices.filter(i => (i.status || '').toLowerCase() === 'unpaid' || (i.status || '').toLowerCase() === 'overdue' || (i.status || '').toLowerCase() === 'outstanding')
+      case 'outstanding_bal': {
+        const unpaidInvoices = filteredInvoices.filter(i => getInvoiceDue(i) > 0)
         dynamicTable = {
-          headers: ['Client Name', 'Invoice Date', 'Due Date', 'Balance Due ($)'],
+          headers: ['Client Name', 'Invoice #', 'Invoice Date', 'Due Date', 'Balance Due ($)'],
           rows: unpaidInvoices.map(i => ({
-            name: i.clientName || i.patientName || 'Client',
-            last: i.issueDate || (i.createdAt ? new Date(i.createdAt).toISOString().split('T')[0] : '—'),
+            client: i.clientName || i.patientName || 'Client',
+            inv: i.displayId || i.invoiceNumber || `INV-${(i.id || '').substring(0, 4)}`,
+            date: i.issueDate || (i.createdAt ? new Date(i.createdAt).toISOString().split('T')[0] : '—'),
             due: i.dueDate || '—',
-            balance: `$${(parseFloat(i.due || i.amount) || 0).toLocaleString()}`
+            balance: `$${getInvoiceDue(i).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
           }))
         }
         break
+      }
 
       case 'client_reg':
         dynamicTable = {
@@ -2056,30 +2200,149 @@ const getReports = async (req, res, next) => {
         }
         break
 
+      case 'client_demo': {
+        const activeCount = patients.filter(p => (p.status || '').toLowerCase() === 'active').length
+        const inactiveCount = patients.length - activeCount
+        dynamicTable = {
+          headers: ['Client Category', 'Count', 'Percentage (%)'],
+          rows: [
+            { cat: 'Active Clients', count: activeCount, pct: `${patients.length > 0 ? ((activeCount / patients.length) * 100).toFixed(1) : 0}%` },
+            { cat: 'Inactive Clients', count: inactiveCount, pct: `${patients.length > 0 ? ((inactiveCount / patients.length) * 100).toFixed(1) : 0}%` }
+          ]
+        }
+        break
+      }
+
+      case 'appt_counts': {
+        const pracCounts = {}
+        filteredAppointments.forEach(a => {
+          const p = a.practitionerName || 'General Practitioner'
+          if (!pracCounts[p]) pracCounts[p] = { completed: 0, cancelled: 0, noshow: 0, total: 0 }
+          pracCounts[p].total += 1
+          const st = (a.status || '').toLowerCase()
+          if (st === 'completed') pracCounts[p].completed += 1
+          else if (st.includes('cancel')) pracCounts[p].cancelled += 1
+          else if (st.includes('no show') || st.includes('noshow')) pracCounts[p].noshow += 1
+        })
+        dynamicTable = {
+          headers: ['Practitioner', 'Completed', 'Cancelled', 'No Shows', 'Total Scheduled'],
+          rows: Object.entries(pracCounts).map(([name, c]) => ({
+            name,
+            completed: c.completed,
+            cancelled: c.cancelled,
+            noshow: c.noshow,
+            total: c.total
+          }))
+        }
+        break
+      }
+
+      case 'cancel_rates': {
+        const pracCancel = {}
+        filteredAppointments.forEach(a => {
+          const p = a.practitionerName || 'General Practitioner'
+          if (!pracCancel[p]) pracCancel[p] = { completed: 0, cancelled: 0, total: 0 }
+          pracCancel[p].total += 1
+          const st = (a.status || '').toLowerCase()
+          if (st === 'completed') pracCancel[p].completed += 1
+          else if (st.includes('cancel')) pracCancel[p].cancelled += 1
+        })
+        dynamicTable = {
+          headers: ['Practitioner', 'Completed Appointments', 'Cancelled Appointments', 'Cancellation Rate (%)'],
+          rows: Object.entries(pracCancel).map(([name, c]) => ({
+            name,
+            completed: c.completed,
+            cancelled: c.cancelled,
+            rate: `${c.total > 0 ? ((c.cancelled / c.total) * 100).toFixed(1) : 0}%`
+          }))
+        }
+        break
+      }
+
+      case 'prac_util': {
+        const pracHours = {}
+        dbPractitioners.forEach(p => {
+          pracHours[p] = { hours: 0, capacity: 40 }
+        })
+        filteredAppointments.forEach(a => {
+          const p = a.practitionerName || (dbPractitioners[0] || 'Practitioner')
+          if (!pracHours[p]) pracHours[p] = { hours: 0, capacity: 40 }
+          pracHours[p].hours += (parseFloat(a.duration) || 60) / 60
+        })
+        dynamicTable = {
+          headers: ['Practitioner Name', 'Hours Scheduled', 'Available Capacity (h)', 'Utilisation Rate (%)'],
+          rows: Object.entries(pracHours).map(([name, h]) => ({
+            name,
+            scheduled: `${h.hours.toFixed(1)}h`,
+            capacity: `${h.capacity}h`,
+            rate: `${Math.min(100, Math.round((h.hours / h.capacity) * 100))}%`
+          }))
+        }
+        break
+      }
+
       case 'exec_dashboard':
         dynamicTable = {
           headers: ['Metric Name', 'Current Value', 'Status'],
           rows: [
-            { metric: 'Total Revenue', current: `$${revenue.toLocaleString()}`, status: 'Live DB' },
-            { metric: 'New Client Registrations', current: newClientsCount, status: 'Live DB' },
-            { metric: 'Total Appointments Count', current: totalApptsCount, status: 'Live DB' },
-            { metric: 'Appointment Cancellation Rate', current: `${cancellationRate}%`, status: 'Live DB' }
+            { metric: 'Total Revenue', current: `$${revenue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, status: 'Active' },
+            { metric: 'Outstanding Balance', current: `$${outstanding.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, status: 'Active' },
+            { metric: 'New Client Registrations', current: newClientsCount, status: 'Active' },
+            { metric: 'Total Appointments Count', current: totalApptsCount, status: 'Active' },
+            { metric: 'Appointment Cancellation Rate', current: `${cancellationRate}%`, status: 'Active' }
           ]
         }
         break
 
       case 'all_summary':
-      default:
+      default: {
+        const summaryRows = intervals.map(int => {
+          const intPayments = filteredPayments.filter(p => {
+            const d = normalizeToIsoDate(p.paymentDate) || normalizeToIsoDate(p.createdAt)
+            return d && d >= int.startIso && d < int.endIso
+          })
+          const intPaidInvoices = filteredInvoices.filter(i => {
+            const d = normalizeToIsoDate(i.issueDate) || normalizeToIsoDate(i.createdAt)
+            return (i.status || '').toLowerCase() === 'paid' && d && d >= int.startIso && d < int.endIso
+          })
+          const intRev = filteredPayments.length > 0
+            ? intPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
+            : intPaidInvoices.reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
+
+          const intInvoices = filteredInvoices.filter(i => {
+            const d = normalizeToIsoDate(i.issueDate) || normalizeToIsoDate(i.createdAt)
+            return d && d >= int.startIso && d < int.endIso
+          })
+          const intOut = intInvoices
+            .filter(i => getInvoiceDue(i) > 0)
+            .reduce((acc, i) => acc + getInvoiceDue(i), 0)
+
+          const intAppts = filteredAppointments.filter(a => {
+            const d = normalizeToIsoDate(a.date) || normalizeToIsoDate(a.createdAt)
+            const st = (a.status || '').toLowerCase()
+            return st !== 'cancelled' && st !== 'cancel' && d && d >= int.startIso && d < int.endIso
+          }).length
+
+          const intClients = patients.filter(p => {
+            const d = normalizeToIsoDate(p.createdAt)
+            return d && d >= int.startIso && d < int.endIso
+          }).length
+
+          return {
+            period: int.label,
+            appts: intAppts,
+            clients: intClients,
+            rev: `$${intRev.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+            out: `$${intOut.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+          }
+        })
+
         dynamicTable = {
-          headers: ['Metric', 'Count/Amount'],
-          rows: [
-            { metric: 'Total Appointments', count: totalApptsCount },
-            { metric: 'Total Patients/Clients', count: newClientsCount },
-            { metric: 'Total Revenue ($)', count: `$${revenue.toLocaleString()}` },
-            { metric: 'Outstanding Balance ($)', count: `$${outstanding.toLocaleString()}` }
-          ]
+          headers: ['Period', 'Appointments Completed', 'New Clients', 'Total Revenue ($)', 'Outstanding Balance ($)'],
+          rows: summaryRows
         }
         break
+      }
     }
 
     // Build monthly revenue array from real DB payments (current year vs previous year)
@@ -2108,48 +2371,26 @@ const getReports = async (req, res, next) => {
       previous: Math.round(revenueByMonth[m].previous)
     }))
 
-    // Build period-aware revenue trend if date range is specified
-    let revenueTrend = []
-    if (startDate && endDate) {
-      const sDate = new Date(startDate)
-      const eDate = new Date(endDate)
-      const diffDays = Math.max(1, Math.ceil(Math.abs(eDate - sDate) / (1000 * 60 * 60 * 24)))
+    // Build period-aware revenue trend matching selected period interval grouping
+    const revenueTrend = intervals.map(int => {
+      const intPayments = filteredPayments.filter(p => {
+        const d = normalizeToIsoDate(p.paymentDate) || normalizeToIsoDate(p.createdAt)
+        return d && d >= int.startIso && d < int.endIso
+      })
+      const intPaidInvoices = filteredInvoices.filter(i => {
+        const d = normalizeToIsoDate(i.issueDate) || normalizeToIsoDate(i.createdAt)
+        return (i.status || '').toLowerCase() === 'paid' && d && d >= int.startIso && d < int.endIso
+      })
+      const amt = filteredPayments.length > 0
+        ? intPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
+        : intPaidInvoices.reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
 
-      if (diffDays <= 45) {
-        const stepDays = Math.max(2, Math.round(diffDays / 6))
-        let curr = new Date(sDate)
-        const buckets = []
-        while (curr <= eDate && buckets.length < 8) {
-          const label = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
-          const currIso = curr.toISOString().split('T')[0]
-          const nextDay = new Date(curr)
-          nextDay.setDate(nextDay.getDate() + stepDays)
-          const nextIso = nextDay.toISOString().split('T')[0]
-
-          const periodPayments = filteredPayments.filter(p => {
-            const d = p.paymentDate || (p.createdAt ? new Date(p.createdAt).toISOString().split('T')[0] : null)
-            return d && d >= currIso && d < nextIso
-          })
-          const amt = periodPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
-          buckets.push({
-            name: label,
-            current: Math.round(amt > 0 ? amt : (revenue / 6)),
-            previous: Math.round((amt > 0 ? amt : (revenue / 6)) * 0.82)
-          })
-          curr = nextDay
-        }
-        if (buckets.length > 0) revenueTrend = buckets
-      } else {
-        // Multi-month: only include months within date range
-        const startMonthIdx = sDate.getMonth()
-        const endMonthIdx = eDate.getMonth()
-        revenueTrend = monthlyRevenue.filter((_, idx) => {
-          if (startMonthIdx <= endMonthIdx) return idx >= startMonthIdx && idx <= endMonthIdx
-          return idx >= startMonthIdx || idx <= endMonthIdx
-        })
+      return {
+        name: int.chartLabel || int.label,
+        current: Math.round(amt),
+        previous: 0
       }
-    }
-    if (!revenueTrend.length) revenueTrend = monthlyRevenue
+    })
 
     // Build client growth array from patients grouped by month
     const clientGrowthByMonth = {}
@@ -2196,6 +2437,7 @@ const getReports = async (req, res, next) => {
           cancellation: cancellationRate,
           newClients: newClientsCount,
           outstanding,
+          practitionersCount: dbPractitioners.length,
           uninvoiced: uninvoicedCount
         },
         monthlyRevenue: revenueTrend,
@@ -3896,10 +4138,19 @@ const getDashboardStats = async (req, res, next) => {
       const s = (i.status || '').toLowerCase()
       return s === 'paid' || s === 'completed' || (Number(i.due) === 0 && (Number(i.amount) || 0) > 0)
     }
-    const nonCancelled = allInvoices.filter(i => (i.status || '').toLowerCase() !== 'cancelled' && (i.status || '').toLowerCase() !== 'cancel')
+    const isInvoiceCancelled = (i) => {
+      const s = (i.status || '').toLowerCase()
+      return s === 'cancelled' || s === 'cancel'
+    }
+    const getInvoiceDue = (i) => {
+      if (isInvoiceSettled(i) || isInvoiceCancelled(i) || (i.status || '').toLowerCase() === 'draft') return 0
+      if (i.due !== undefined && i.due !== null) return Math.max(0, parseFloat(i.due) || 0)
+      return Math.max(0, parseFloat(i.amount) || 0)
+    }
+    const nonCancelled = allInvoices.filter(i => !isInvoiceCancelled(i) && (i.status || '').toLowerCase() !== 'draft')
     const paidInvoices = nonCancelled.filter(isInvoiceSettled)
-    const outstandingInvoices = nonCancelled.filter(i => !isInvoiceSettled(i) && (Number(i.due) || 0) > 0)
-    const outstandingAmount = outstandingInvoices.reduce((s, i) => s + (Number(i.due) || 0), 0)
+    const outstandingInvoices = nonCancelled.filter(i => getInvoiceDue(i) > 0)
+    const outstandingAmount = outstandingInvoices.reduce((s, i) => s + getInvoiceDue(i), 0)
     const totalRevenue = paidInvoices.reduce((s, i) => s + (Number(i.amount) || 0), 0)
     const paymentRate = totalInvoices > 0 ? Math.round((paidInvoices.length / totalInvoices) * 100) : 0
 
