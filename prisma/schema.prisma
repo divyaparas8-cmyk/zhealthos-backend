@@ -266,9 +266,25 @@ model Invoice {
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
-  patient Patient? @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  patient           Patient?            @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  idempotencyRecord InvoiceIdempotency?
 
   @@map("invoices")
+}
+
+model InvoiceIdempotency {
+  id             String   @id @default(uuid())
+  clinicId       String
+  idempotencyKey String
+  requestHash    String
+  invoiceId      String   @unique
+  createdAt      DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@unique([clinicId, idempotencyKey], name: "clinic_idempotency_key_idx")
+  @@index([clinicId])
+  @@map("invoice_idempotency")
 }
 
 model Payment {

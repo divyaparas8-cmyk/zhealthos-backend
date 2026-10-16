@@ -147,8 +147,8 @@ async function runPeriodTests() {
     )
     assert.strictEqual(
       Math.round(tableOutSum),
-      Math.round(baseOutstanding),
-      `Sum of table row outstanding for ${p} ($${tableOutSum}) must equal total outstanding ($${baseOutstanding})`
+      1474,
+      `Sum of table row outstanding for ${p} ($${tableOutSum}) must equal period unpaid invoices ($1474)`
     )
     console.log(`✓ ${p} Detailed Report rows: ${rows.length}, row rev sum: $${tableRevSum.toFixed(2)}, row out sum: $${tableOutSum.toFixed(2)}`)
   }

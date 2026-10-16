@@ -541,6 +541,39 @@ const getInvoices = async (req, res, next) => {
   }
 }
 
+// Canonical semantic hash for invoice creation idempotency
+const computeCanonicalInvoiceHash = (data, clinicId) => {
+  const normalized = {
+    clinicId: String(clinicId || '').trim(),
+    clientName: (data.clientName || data.patientName || '').trim().toLowerCase(),
+    patientId: data.patientId ? String(data.patientId).trim() : null,
+    recipient: (data.recipient || data.clientName || data.patientName || '').trim().toLowerCase(),
+    practitionerName: (data.practitionerName || '').trim().toLowerCase(),
+    service: (data.service || '').trim().toLowerCase(),
+    issueDate: String(data.issueDate || '').trim(),
+    dueDate: String(data.dueDate || '').trim(),
+    amount: Number(parseFloat(data.amount) || 0).toFixed(2),
+    status: (data.status || 'Processing').trim().toLowerCase(),
+    items: Array.isArray(data.items)
+      ? data.items
+          .map(it => ({
+            itemCode: String(it.itemCode || it.ndisCode || '').trim().toLowerCase(),
+            description: String(it.description || '').trim().toLowerCase(),
+            quantity: Number(parseFloat(it.quantity) || 1).toFixed(2),
+            rate: Number(parseFloat(it.rate) || 0).toFixed(2),
+            total: Number(parseFloat(it.total) || 0).toFixed(2),
+            taxRate: String(it.taxRate || 'GST Free Income').trim().toLowerCase()
+          }))
+          .sort((a, b) => a.itemCode.localeCompare(b.itemCode) || a.description.localeCompare(b.description))
+      : []
+  }
+
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(normalized))
+    .digest('hex')
+}
+
 const createInvoice = async (req, res, next) => {
   try {
     const {
@@ -548,13 +581,20 @@ const createInvoice = async (req, res, next) => {
       service, patientId, issueDate, dueDate, items
     } = req.body
 
+    const idempotencyKey = req.headers['x-idempotency-key'] || req.body.idempotencyKey || null
     const userClinicId = await getClinicIdFromReq(req)
 
-    const count = await prisma.invoice.count().catch(() => 0)
-    const displayId = `INV-${String(count + 1).padStart(6, '0')}`
+    // Requirement 4: Tenant context validation for keyed requests
+    if (idempotencyKey && !userClinicId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Tenant context required for idempotent invoice creation'
+      })
+    }
+
     const finalClientName = clientName || patientName || 'Client'
 
-    // Finding 22: Parse items and derive authoritative amount from line items sum
+    // Parse items and derive authoritative amount from line items sum
     let parsedItems = null
     if (items) {
       parsedItems = typeof items === 'string' ? JSON.parse(items) : items
@@ -607,38 +647,160 @@ const createInvoice = async (req, res, next) => {
     const itemsDerivedTotal = itemsSubtotal > 0 ? parseFloat((itemsSubtotal + gstTotal).toFixed(2)) : 0
 
     const submittedAmount = parseFloat(amount) || 0.0
-    // If items have meaningful rates, use items sum (plus tax) as authoritative total
     const finalAmount = itemsDerivedTotal > 0 ? itemsDerivedTotal : submittedAmount
 
-    // Reconcile status and due balance at creation (Finding 21)
     const isPaidStatus = (status || '').toLowerCase() === 'paid' || (status || '').toLowerCase() === 'completed'
     let finalDue = isPaidStatus ? 0.0 : (due !== undefined && due !== null ? Math.max(0, parseFloat(due)) : finalAmount)
-    // Ensure due never exceeds the reconciled amount
     finalDue = parseFloat(Math.min(finalDue, finalAmount).toFixed(2))
     let finalStatus = isPaidStatus ? 'Paid' : (finalDue === 0.0 && finalAmount > 0 ? 'Paid' : (status || 'Processing'))
 
-    const inv = await prisma.invoice.create({
-      data: {
-        displayId,
-        invoiceNumber: displayId,
-        clinicId: userClinicId || null,
-        clientName: finalClientName,
-        patientName: finalClientName,
-        recipient: recipient || finalClientName,
-        practitionerName: practitionerName || 'General Practitioner',
-        amount: finalAmount,
-        due: finalDue,
-        status: finalStatus,
-        sentStatus: sentStatus || 'Not Sent',
-        service: service || 'General',
-        patientId: patientId || null,
-        issueDate: issueDate || new Date().toISOString().split('T')[0],
-        dueDate: dueDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-        items: parsedItems
-      }
-    })
+    const invoicePayloadForHash = {
+      clientName: finalClientName,
+      patientId: patientId || null,
+      recipient: recipient || finalClientName,
+      practitionerName: practitionerName || 'General Practitioner',
+      service: service || 'General',
+      issueDate: issueDate || new Date().toISOString().split('T')[0],
+      dueDate: dueDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+      amount: finalAmount,
+      status: finalStatus,
+      items: parsedItems
+    }
 
-    // Auto-sync corresponding claim transaction for Patient Portal Funding & Claims ledger
+    const currentRequestHash = computeCanonicalInvoiceHash(invoicePayloadForHash, userClinicId)
+
+    // Pre-flight check: If an idempotency record already exists in database
+    if (idempotencyKey && prisma.invoiceIdempotency) {
+      try {
+        const existingRecord = await prisma.invoiceIdempotency.findUnique({
+          where: {
+            clinic_idempotency_key_idx: { clinicId: userClinicId, idempotencyKey }
+          },
+          include: { invoice: true }
+        })
+
+        if (existingRecord?.invoice) {
+          if (existingRecord.requestHash !== currentRequestHash) {
+            return res.status(409).json({
+              success: false,
+              error: 'Idempotency key was previously used with different invoice parameters. Please generate a new key for a different invoice.'
+            })
+          }
+          return res.status(200).json({
+            success: true,
+            data: existingRecord.invoice,
+            idempotentReplay: true
+          })
+        }
+      } catch (checkErr) {
+        console.warn('Idempotency pre-check notice:', checkErr.message)
+      }
+    }
+
+    // Concurrency-safe invoice creation with bounded retry loop (up to 3 attempts)
+    let attempts = 0
+    const maxAttempts = 3
+    let inv = null
+
+    while (attempts < maxAttempts) {
+      attempts++
+
+      // Query latest displayId starting with 'INV-'
+      const maxInv = await prisma.invoice.findFirst({
+        where: { displayId: { startsWith: 'INV-' } },
+        orderBy: { displayId: 'desc' },
+        select: { displayId: true }
+      }).catch(() => null)
+
+      let nextNum = 1
+      if (maxInv?.displayId) {
+        const match = maxInv.displayId.match(/^INV-(\d+)$/)
+        if (match) {
+          nextNum = parseInt(match[1], 10) + attempts
+        }
+      } else {
+        const count = await prisma.invoice.count().catch(() => 0)
+        nextNum = count + attempts
+      }
+
+      const displayId = `INV-${String(nextNum).padStart(6, '0')}`
+
+      try {
+        inv = await prisma.$transaction(async (tx) => {
+          const created = await tx.invoice.create({
+            data: {
+              ...invoicePayloadForHash,
+              displayId,
+              invoiceNumber: displayId,
+              clinicId: userClinicId || null,
+              patientName: finalClientName,
+              due: finalDue,
+              sentStatus: sentStatus || 'Not Sent'
+            }
+          })
+
+          if (idempotencyKey && tx.invoiceIdempotency) {
+            await tx.invoiceIdempotency.create({
+              data: {
+                clinicId: userClinicId,
+                idempotencyKey,
+                requestHash: currentRequestHash,
+                invoiceId: created.id
+              }
+            })
+          }
+
+          return created
+        })
+
+        break // Successfully created!
+      } catch (err) {
+        if (err.code === 'P2002') {
+          const target = Array.isArray(err.meta?.target) ? err.meta.target.join(',') : String(err.meta?.target || '')
+          const isDisplayIdCollision = target.includes('displayId') || target.includes('invoices_displayId_key')
+
+          // Case B: displayId collision (another concurrent request took the same invoice number)
+          if (isDisplayIdCollision) {
+            await new Promise(r => setTimeout(r, 10 + Math.random() * 20))
+            continue
+          }
+
+          // Case A: Idempotency Key collision (concurrent request won the race)
+          if (idempotencyKey && prisma.invoiceIdempotency) {
+            const raceWinner = await prisma.invoiceIdempotency.findUnique({
+              where: {
+                clinic_idempotency_key_idx: { clinicId: userClinicId, idempotencyKey }
+              },
+              include: { invoice: true }
+            }).catch(() => null)
+
+            if (raceWinner?.invoice) {
+              if (raceWinner.requestHash !== currentRequestHash) {
+                return res.status(409).json({
+                  success: false,
+                  error: 'Idempotency key was previously used with different invoice parameters. Please generate a new key for a different invoice.'
+                })
+              }
+              return res.status(200).json({
+                success: true,
+                data: raceWinner.invoice,
+                idempotentReplay: true
+              })
+            }
+          }
+        }
+
+        if (attempts >= maxAttempts) throw err
+        // If unknown error and attempts remain, retry with slight backoff
+        await new Promise(r => setTimeout(r, 10))
+      }
+    }
+
+    if (!inv) {
+      throw new Error('Failed to create invoice after bounded numbering retries')
+    }
+
+    // Auto-sync corresponding claim transaction for Patient Portal Funding & Claims ledger (non-blocking)
     try {
       let targetPatientId = patientId || null
       if (!targetPatientId && finalClientName) {
@@ -652,7 +814,7 @@ const createInvoice = async (req, res, next) => {
         const fundingProg = req.body.funding || req.body.claimType || req.body.fundingProgram || 'NDIS'
         await prisma.patientClaim.create({
           data: {
-            displayId: `CLM-${displayId.replace('INV-', '')}`,
+            displayId: `CLM-${inv.displayId.replace('INV-', '')}`,
             patientId: targetPatientId,
             clinicId: userClinicId || null,
             service: service || 'Clinical Care Service',
@@ -2095,9 +2257,9 @@ const getReports = async (req, res, next) => {
     }
 
     const newClientsCount = patients.length
-    // Period outstanding: unpaid balance on filtered invoices (respecting date range, practitioner & location)
-    const periodUnsettled = filteredInvoices.filter(i => getInvoiceDue(i) > 0)
-    const outstanding = periodUnsettled.reduce((acc, i) => acc + getInvoiceDue(i), 0)
+    // Total current unpaid balance across all active tenant invoices (canonical alignment with Dashboard Outstanding)
+    const activeUnsettledInvoices = invoices.filter(i => getInvoiceDue(i) > 0)
+    const outstanding = parseFloat(activeUnsettledInvoices.reduce((acc, i) => acc + getInvoiceDue(i), 0).toFixed(2))
     const uninvoicedCount = filteredInvoices.filter(i => (i.status || '').toLowerCase() === 'draft').length
 
     // Extract list of practitioners from db
@@ -4476,6 +4638,7 @@ module.exports = {
   deletePractitioner,
   getInvoices,
   createInvoice,
+  computeCanonicalInvoiceHash,
   updateInvoice,
   deleteInvoice,
   getPayments,
