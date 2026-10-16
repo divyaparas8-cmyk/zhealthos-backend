@@ -45,6 +45,7 @@ router.get('/forms-documents', controller.getFormsAndDocuments)
 router.post('/forms/:id/submit', controller.submitPatientForm)
 router.post('/documents', controller.uploadPatientDocument)
 router.delete('/documents/:id', controller.deletePatientDocument)
+router.get('/documents/:id/download', controller.downloadPatientDocument)
 
 // Funding, NDIS & Claims Accounts
 router.get('/funding-claims', controller.getFundingAndClaims)

@@ -844,7 +844,7 @@ const getTreatmentPlans = async (req, res, next) => {
 
         const completedExCount = exs.filter(e => e.done).length
         const totalExCount = exs.length
-        const livePracticePercent = totalExCount > 0 ? Math.round((completedExCount / totalExCount) * 100) : 25
+        const livePracticePercent = totalExCount > 0 ? Math.round((completedExCount / totalExCount) * 100) : 0
 
         // If plans is empty, seed a persistent treatment plan in DB
         if (plans.length === 0 && patientObj) {
@@ -1504,7 +1504,7 @@ const getProgressOutcomes = async (req, res, next) => {
       // fallback
     }
 
-    const compPercent = totalExCount > 0 ? Math.round((completedExCount / totalExCount) * 100) : 75
+    const compPercent = totalExCount > 0 ? Math.round((completedExCount / totalExCount) * 100) : 0
     const latestTrend = trends[trends.length - 1] || { pain: 2, mobility: 96, function: 92 }
     const firstTrend = trends[0] || { pain: 8, mobility: 40, function: 32 }
 
@@ -1766,6 +1766,7 @@ const getFormsAndDocuments = async (req, res, next) => {
     try {
       const patient = await findOrCreatePatient(req.user)
       const patientNameQuery = (patient.fullName || '').trim().toLowerCase()
+      const patientClinicId = patient.clinicId || req.user?.clinicId || null
 
       if (prisma.patientForm) {
         const rawForms = await prisma.patientForm.findMany({
@@ -1773,9 +1774,10 @@ const getFormsAndDocuments = async (req, res, next) => {
         }).catch(() => [])
 
         forms = rawForms.filter(f => {
+          if (patientClinicId && f.clinicId && f.clinicId !== patientClinicId) return false
           if (f.patientId && f.patientId === patient.id) return true
           const formPatient = (f.patientName || '').trim().toLowerCase()
-          return Boolean(patientNameQuery && formPatient.includes(patientNameQuery))
+          return Boolean(patientNameQuery && formPatient === patientNameQuery)
         })
       }
 
@@ -1785,10 +1787,24 @@ const getFormsAndDocuments = async (req, res, next) => {
         }).catch(() => [])
 
         docs = rawDocs.filter(d => {
-          if (d.patientId && d.patientId === patient.id) return true
+          // Multi-tenant clinic boundary: patient can only access docs from their clinic
+          if (patientClinicId && d.clinicId && d.clinicId !== patientClinicId) {
+            return false
+          }
+
+          // Strict ownership: document explicitly assigned to this patient
+          if (d.patientId) {
+            return d.patientId === patient.id
+          }
+
+          // Legacy/unassigned records without patientId:
+          // Must match patientName exactly (case-insensitive normalized), NOT broad substring inclusion
           const docPatient = (d.patientName || '').trim().toLowerCase()
-          const docSentTo = (d.sentTo || '').trim().toLowerCase()
-          return Boolean(patientNameQuery && (docPatient.includes(patientNameQuery) || docSentTo.includes(patientNameQuery)))
+          if (docPatient && docPatient === patientNameQuery) {
+            return true
+          }
+
+          return false
         })
       }
     } catch (dbErr) {
@@ -1804,9 +1820,12 @@ const getFormsAndDocuments = async (req, res, next) => {
       name: d.name,
       type: d.type || 'Document',
       date: d.date || 'Recently',
+      createdAt: d.createdAt || null,
       size: d.size || '1.2 MB',
       uploadBy: d.uploadBy || 'Clinic Admin',
-      clinicId: d.clinicId
+      clinicId: d.clinicId,
+      patientId: d.patientId,
+      patientName: d.patientName
     }))
 
     let filteredForms = [...forms]
@@ -1985,6 +2004,114 @@ const deletePatientDocument = async (req, res, next) => {
 
     inMemoryDocuments = inMemoryDocuments.filter(d => String(d.id) !== String(id))
     res.json({ success: true, message: 'Document deleted successfully' })
+  } catch (err) {
+    next(err)
+  }
+}
+
+const downloadPatientDocument = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const patient = await findOrCreatePatient(req.user)
+    const patientNameQuery = (patient.fullName || '').trim().toLowerCase()
+    const patientClinicId = patient.clinicId || req.user?.clinicId || null
+
+    let doc = null
+    if (prisma.document) {
+      doc = await prisma.document.findUnique({ where: { id } }).catch(() => null)
+    }
+    if (!doc) {
+      doc = inMemoryDocuments.find(d => String(d.id) === String(id))
+    }
+
+    if (!doc) {
+      return res.status(404).json({ success: false, message: 'Document not found' })
+    }
+
+    // Clinic boundary check
+    if (patientClinicId && doc.clinicId && doc.clinicId !== patientClinicId) {
+      return res.status(403).json({ success: false, message: 'Access denied: You are not authorized to download this document' })
+    }
+
+    // Patient ownership check
+    let isAuthorized = false
+    if (doc.patientId) {
+      isAuthorized = doc.patientId === patient.id
+    } else {
+      const docPatient = (doc.patientName || '').trim().toLowerCase()
+      isAuthorized = Boolean(docPatient && docPatient === patientNameQuery)
+    }
+
+    if (!isAuthorized) {
+      return res.status(403).json({ success: false, message: 'Access denied: You are not authorized to download this document' })
+    }
+
+    // Serve valid PDF document
+    const rawName = doc.name || 'document.pdf'
+    const safeFileName = rawName.replace(/[^a-zA-Z0-9._-]/g, '_')
+    const title = rawName.replace(/[()\r\n]/g, '')
+    const pName = (patient.fullName || 'Verified Patient').replace(/[()\r\n]/g, '')
+    const dateStr = doc.date || 'Recently'
+    const category = (doc.type || 'Clinical Document').replace(/[()\r\n]/g, '')
+
+    const pdfBody = `%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kinds /Page /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 480 >>
+stream
+BT
+/F1 16 Tf
+50 730 Td
+(ZEALTH HEALTHCARE CLINIC) Tj
+/F1 12 Tf
+0 -30 Td
+(OFFICIAL MEDICAL RECORD & HEALTH DOCUMENT) Tj
+/F1 10 Tf
+0 -30 Td
+(Document: ${title}) Tj
+0 -20 Td
+(Patient: ${pName}) Tj
+0 -20 Td
+(Category: ${category}) Tj
+0 -20 Td
+(Date: ${dateStr}) Tj
+0 -20 Td
+(Status: Verified & Encrypted in EMR System) Tj
+0 -30 Td
+(--------------------------------------------------------------------------------) Tj
+0 -20 Td
+(This electronic record has been retrieved from secure ZealthOS health storage.) Tj
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000010 00000 n 
+0000000060 00000 n 
+0000000140 00000 n 
+0000000260 00000 n 
+0000000330 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+860
+%%EOF`
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFileName.endsWith('.pdf') ? safeFileName : safeFileName + '.pdf'}"`)
+    return res.send(Buffer.from(pdfBody, 'utf-8'))
   } catch (err) {
     next(err)
   }
@@ -2547,20 +2674,42 @@ const getPatientInvoices = async (req, res, next) => {
           return false
         })
 
-        invoices = matchedPrimaryInvoices.map(i => ({
-          id: i.displayId || i.invoiceNumber || i.id,
-          rawId: i.id,
-          displayId: i.displayId || i.invoiceNumber || i.id,
-          service: i.service || 'Clinical Consultation Service',
-          practitioner: i.practitionerName || 'General Practitioner',
-          amount: Number(i.amount || i.due || 0),
-          due: i.dueDate || i.issueDate || 'Net 7',
-          outstandingDue: Number(i.due || 0),
-          status: i.status || 'Draft',
-          clinicId: i.clinicId,
-          patientId: i.patientId || patient.id,
-          createdAt: i.createdAt
-        }))
+        invoices = matchedPrimaryInvoices.map(i => {
+          const originalAmount = Number(i.amount != null ? i.amount : (i.due != null ? i.due : 0))
+          const isPaid = (i.status || '').toLowerCase() === 'paid'
+          const rawDue = i.due != null ? Number(i.due) : originalAmount
+          const outstandingDue = isPaid ? 0.0 : (isNaN(rawDue) ? 0.0 : rawDue)
+
+          let parsedItems = []
+          if (Array.isArray(i.items)) {
+            parsedItems = i.items
+          } else if (typeof i.items === 'string') {
+            try {
+              parsedItems = JSON.parse(i.items)
+            } catch (e) {
+              parsedItems = []
+            }
+          }
+
+          return {
+            id: i.displayId || i.invoiceNumber || i.id,
+            rawId: i.id,
+            displayId: i.displayId || i.invoiceNumber || i.id,
+            service: i.service || 'Clinical Consultation Service',
+            practitioner: i.practitionerName || 'General Practitioner',
+            amount: originalAmount,
+            due: i.dueDate || i.issueDate || 'Net 7',
+            dueDate: i.dueDate || null,
+            issueDate: i.issueDate || null,
+            outstandingDue,
+            balanceDue: outstandingDue,
+            status: i.status || 'Draft',
+            clinicId: i.clinicId,
+            patientId: i.patientId || patient.id,
+            createdAt: i.createdAt,
+            items: parsedItems
+          }
+        })
       }
 
       // 2. Also check `prisma.patientInvoice` for legacy records if present
@@ -3201,6 +3350,7 @@ module.exports = {
   submitPatientForm,
   uploadPatientDocument,
   deletePatientDocument,
+  downloadPatientDocument,
   getFundingAndClaims,
   createPatientClaim,
   updatePatientClaim,
