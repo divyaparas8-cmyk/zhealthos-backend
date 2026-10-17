@@ -697,15 +697,18 @@ const createInvoice = async (req, res, next) => {
       }
     }
 
-    // Concurrency-safe invoice creation with bounded retry loop (up to 3 attempts)
+    // Concurrency-safe invoice creation with bounded retry loop (up to 5 attempts)
+    // NOTE: Application-level MAX+1 with retry produces sequential IDs under concurrent commits.
+    // However, gap-free numbering cannot be mathematically guaranteed if records are later deleted,
+    // voided, or if an external database operation rolls back after number reservation.
     let attempts = 0
-    const maxAttempts = 3
+    const maxAttempts = 5
     let inv = null
 
     while (attempts < maxAttempts) {
       attempts++
 
-      // Query latest displayId starting with 'INV-'
+      // Query latest displayId starting with 'INV-' globally across clinic scope
       const maxInv = await prisma.invoice.findFirst({
         where: { displayId: { startsWith: 'INV-' } },
         orderBy: { displayId: 'desc' },
@@ -716,11 +719,12 @@ const createInvoice = async (req, res, next) => {
       if (maxInv?.displayId) {
         const match = maxInv.displayId.match(/^INV-(\d+)$/)
         if (match) {
-          nextNum = parseInt(match[1], 10) + attempts
+          // Increment by 1 from the highest existing invoice number (never add 'attempts' to avoid artificial gaps)
+          nextNum = parseInt(match[1], 10) + 1
         }
       } else {
         const count = await prisma.invoice.count().catch(() => 0)
-        nextNum = count + attempts
+        nextNum = count + 1
       }
 
       const displayId = `INV-${String(nextNum).padStart(6, '0')}`
@@ -761,7 +765,8 @@ const createInvoice = async (req, res, next) => {
 
           // Case B: displayId collision (another concurrent request took the same invoice number)
           if (isDisplayIdCollision) {
-            await new Promise(r => setTimeout(r, 10 + Math.random() * 20))
+            // Apply randomized jitter backoff before retrying next fresh transaction
+            await new Promise(r => setTimeout(r, 15 + Math.random() * 35))
             continue
           }
 
@@ -839,6 +844,12 @@ const createInvoice = async (req, res, next) => {
 const updateInvoice = async (req, res, next) => {
   try {
     const { id } = req.params
+
+    const existingInv = await prisma.invoice.findUnique({ where: { id } })
+    if (!existingInv) {
+      return res.status(404).json({ success: false, message: 'Invoice not found' })
+    }
+
     const updateData = { ...req.body }
     delete updateData.id
     delete updateData.createdAt
@@ -902,24 +913,55 @@ const updateInvoice = async (req, res, next) => {
       updateData.amount = parseFloat(updateData.amount)
     }
 
-    if (updateData.due !== undefined) updateData.due = Math.max(0, parseFloat(updateData.due))
+    const currentAmount = updateData.amount !== undefined ? updateData.amount : parseFloat(existingInv.amount || 0)
 
-    // Reconcile status and due balance during updates (Finding 21)
-    if (updateData.status) {
-      const s = updateData.status.toLowerCase()
-      if (s === 'paid' || s === 'completed') {
-        updateData.due = 0.0
-        updateData.status = 'Paid'
+    // Query verified payments linked to this invoice
+    const refMatches = [existingInv.displayId, existingInv.invoiceNumber, existingInv.id].filter(Boolean)
+    const linkedPayments = await prisma.payment.findMany({
+      where: {
+        invoiceReference: { in: refMatches }
       }
-    }
-    if (updateData.due === 0 && updateData.status !== 'Cancelled' && updateData.status !== 'Draft') {
-      updateData.status = 'Paid'
-      updateData.due = 0.0
+    })
+    const totalPaidAllocations = linkedPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
+    const verifiedDue = Math.max(0, parseFloat((currentAmount - totalPaidAllocations).toFixed(2)))
+
+    // PART 1 SAFEGUARDS: Check if caller attempts to bypass payment allocation
+    const incomingStatus = (updateData.status || '').toLowerCase().trim()
+    const isDirectPaidAttempt = (incomingStatus === 'paid' || incomingStatus === 'completed') && (existingInv.status || '').toLowerCase() !== 'paid'
+    const isDirectDueZeroAttempt = updateData.due !== undefined && parseFloat(updateData.due) === 0 && (parseFloat(existingInv.due) > 0 || (existingInv.due === null && currentAmount > 0))
+
+    if ((isDirectPaidAttempt || (isDirectDueZeroAttempt && incomingStatus !== 'cancelled' && incomingStatus !== 'draft')) && verifiedDue > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Direct status change to Paid or setting Balance Due to $0.00 is not permitted without verified payment allocations. To settle this invoice, please use the Record Payment workflow in Payments Centre.'
+      })
     }
 
-    // Ensure due never exceeds the reconciled amount
-    if (updateData.due !== undefined && updateData.amount !== undefined) {
-      updateData.due = parseFloat(Math.min(updateData.due, updateData.amount).toFixed(2))
+    // Determine derived due and status
+    if (incomingStatus === 'cancelled' || incomingStatus === 'cancel') {
+      updateData.status = 'Cancelled'
+      updateData.due = 0.0
+    } else if (incomingStatus === 'draft') {
+      updateData.status = 'Draft'
+      updateData.due = verifiedDue
+    } else {
+      if (totalPaidAllocations >= currentAmount && currentAmount > 0) {
+        updateData.status = 'Paid'
+        updateData.due = 0.0
+      } else if (totalPaidAllocations > 0 && totalPaidAllocations < currentAmount) {
+        updateData.status = 'Partially Paid'
+        updateData.due = verifiedDue
+      } else {
+        // No payments recorded
+        // If legacy invoice was already marked Paid without payments (e.g. INV-000029), preserve it unless status is explicitly being modified
+        if ((existingInv.status || '').toLowerCase() === 'paid' && !updateData.status) {
+          updateData.status = 'Paid'
+          updateData.due = 0.0
+        } else {
+          updateData.status = updateData.status || existingInv.status || 'Processing'
+          updateData.due = verifiedDue
+        }
+      }
     }
 
     const inv = await prisma.invoice.update({
@@ -935,6 +977,35 @@ const updateInvoice = async (req, res, next) => {
 const deleteInvoice = async (req, res, next) => {
   try {
     const { id } = req.params
+
+    const inv = await prisma.invoice.findUnique({ where: { id } })
+    if (!inv) {
+      return res.status(404).json({ success: false, message: 'Invoice not found' })
+    }
+
+    // Multi-tenant check
+    const userRole = req.user?.role
+    const userClinicId = await getClinicIdFromReq(req)
+    if (userRole !== 'SUPER_ADMIN' && userClinicId && inv.clinicId && inv.clinicId !== userClinicId) {
+      return res.status(403).json({ success: false, message: 'Access denied: cannot delete invoice from another clinic' })
+    }
+
+    // Check for linked payments across displayId, invoiceNumber, and id
+    const refMatches = [inv.displayId, inv.invoiceNumber, inv.id].filter(Boolean)
+    const linkedPayments = await prisma.payment.findMany({
+      where: {
+        invoiceReference: { in: refMatches }
+      }
+    })
+
+    if (linkedPayments.length > 0) {
+      const totalPaid = linkedPayments.reduce((s, p) => s + (parseFloat(p.amount) || 0), 0)
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete invoice ${inv.displayId || inv.invoiceNumber || inv.id}: ${linkedPayments.length} payment(s) totaling $${totalPaid.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} AUD are linked to this invoice. Please void or refund the payments first, or mark the invoice as Cancelled instead.`
+      })
+    }
+
     await prisma.invoice.delete({ where: { id } })
     res.json({ success: true, message: 'Invoice deleted successfully from live database' })
   } catch (err) {
@@ -1860,60 +1931,237 @@ const getPayments = async (req, res, next) => {
   }
 }
 
+// Canonical semantic hash for payment creation idempotency
+const computeCanonicalPaymentHash = (data, clinicId) => {
+  const normalized = {
+    clinicId: String(clinicId || '').trim(),
+    clientName: (data.clientName || data.from || '').trim().toLowerCase(),
+    patientId: data.patientId ? String(data.patientId).trim() : null,
+    amount: Number(parseFloat(data.amount) || 0).toFixed(2),
+    paymentDate: String(data.paymentDate || data.date || '').trim(),
+    paymentMethod: (data.paymentMethod || 'Stripe / Credit Card').trim().toLowerCase(),
+    invoiceReference: (data.invoiceReference || '').trim().toUpperCase()
+  }
+
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(normalized))
+    .digest('hex')
+}
+
 const createPayment = async (req, res, next) => {
   try {
-    const { from, clientName, amount, date, paymentDate, paymentMethod, invoiceReference, patientId, transactionReference } = req.body
+    const { from, clientName, amount, date, paymentDate, paymentMethod, invoiceReference, patientId, transactionReference } = req.body || {}
 
+    const idempotencyKey = req.headers?.['x-idempotency-key'] || req.body?.idempotencyKey || null
     const userClinicId = await getClinicIdFromReq(req)
 
-    const randNum = Math.floor(1000 + Math.random() * 9000)
-    const receiptNumber = `RCPT-${Date.now().toString().slice(-4)}${randNum}`
+    // Tenant context required for keyed payment requests
+    if (idempotencyKey && !userClinicId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Tenant context required for idempotent payment creation'
+      })
+    }
+
+    const payAmt = parseFloat(amount)
+    if (isNaN(payAmt) || payAmt <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Payment amount must be greater than 0'
+      })
+    }
+
     const finalClientName = from || clientName || 'Client'
     const finalDate = paymentDate || date || new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+    const finalMethod = paymentMethod || 'Stripe / Credit Card'
+    const finalInvoiceRef = invoiceReference ? String(invoiceReference).trim() : null
 
-    const payment = await prisma.payment.create({
-      data: {
-        receiptNumber,
-        clinicId: userClinicId || null,
-        clientName: finalClientName,
-        amount: parseFloat(amount) || 0.0,
-        paymentDate: finalDate,
-        paymentMethod: paymentMethod || 'Stripe / Credit Card',
-        invoiceReference: invoiceReference || `INV-${receiptNumber.replace('RCPT-', '')}`,
-        status: 'Successful (Paid)',
-        transactionId: transactionReference || `tx_${receiptNumber.toLowerCase()}_892`,
-        patientId: patientId || null
-      }
-    })
+    const payloadForHash = {
+      from,
+      clientName: finalClientName,
+      patientId: patientId || null,
+      amount: payAmt,
+      date: finalDate,
+      paymentDate: finalDate,
+      paymentMethod: finalMethod,
+      invoiceReference: finalInvoiceRef
+    }
 
-    // Automatically reconcile & deduct against invoice if referenced
-    if (invoiceReference) {
+    const currentRequestHash = computeCanonicalPaymentHash(payloadForHash, userClinicId)
+
+    // Pre-flight check: If idempotency record already exists in database
+    if (idempotencyKey && prisma.paymentIdempotency) {
       try {
-        const matchedInv = await prisma.invoice.findFirst({
+        const existingRecord = await prisma.paymentIdempotency.findUnique({
           where: {
-            OR: [
-              { displayId: invoiceReference },
-              { invoiceNumber: invoiceReference },
-              { id: invoiceReference }
-            ]
-          }
+            clinic_payment_idempotency_key_idx: { clinicId: userClinicId, idempotencyKey }
+          },
+          include: { payment: true }
         })
-        if (matchedInv) {
-          const curDue = matchedInv.due !== undefined && matchedInv.due !== null ? parseFloat(matchedInv.due) : (parseFloat(matchedInv.amount) || 0.0)
-          const payAmt = parseFloat(amount) || 0.0
-          const newDue = Math.max(0, curDue - payAmt)
-          const newStatus = newDue === 0.0 ? 'Paid' : (newDue < (parseFloat(matchedInv.amount) || 0.0) ? 'Partially Paid' : matchedInv.status)
-          await prisma.invoice.update({
-            where: { id: matchedInv.id },
-            data: { due: newDue, status: newStatus }
+
+        if (existingRecord?.payment) {
+          if (existingRecord.requestHash !== currentRequestHash) {
+            return res.status(409).json({
+              success: false,
+              error: 'Idempotency key was previously used with different payment parameters. Please generate a new key for a different payment.'
+            })
+          }
+          return res.status(200).json({
+            success: true,
+            data: existingRecord.payment,
+            idempotentReplay: true
           })
         }
-      } catch (syncErr) {
-        console.warn('Payment invoice deduction notice:', syncErr.message)
+      } catch (checkErr) {
+        console.warn('Payment idempotency pre-check notice:', checkErr.message)
       }
     }
 
-    res.json({ success: true, data: payment })
+    let attempts = 0
+    const maxAttempts = 5
+    let paymentResult = null
+
+    while (attempts < maxAttempts) {
+      attempts++
+
+      const randNum = Math.floor(1000 + Math.random() * 9000)
+      const receiptNumber = `RCPT-${Date.now().toString().slice(-4)}${randNum}`
+      const generatedTxId = transactionReference || `tx_${receiptNumber.toLowerCase()}_892`
+      const resolvedInvoiceRef = finalInvoiceRef || `INV-${receiptNumber.replace('RCPT-', '')}`
+
+      try {
+        paymentResult = await prisma.$transaction(async (tx) => {
+          // If invoice referenced, find and validate inside transaction (atomic overpayment safeguard)
+          if (finalInvoiceRef) {
+            // Pessimistic row locking on target invoice to prevent concurrent overpayment race conditions
+            const lockedInvs = await tx.$queryRawUnsafe(
+              'SELECT id, clinicId, amount, due, status FROM invoices WHERE id = ? OR displayId = ? OR invoiceNumber = ? LIMIT 1 FOR UPDATE',
+              finalInvoiceRef, finalInvoiceRef, finalInvoiceRef
+            )
+            const matchedInv = lockedInvs && lockedInvs.length > 0 ? lockedInvs[0] : null
+
+            if (matchedInv) {
+              if (matchedInv.clinicId && userClinicId && matchedInv.clinicId !== userClinicId) {
+                const err = new Error('Invoice does not belong to the active clinic tenant')
+                err.statusCode = 403
+                throw err
+              }
+
+              const curDue = matchedInv.due !== undefined && matchedInv.due !== null
+                ? parseFloat(matchedInv.due)
+                : (parseFloat(matchedInv.amount) || 0.0)
+
+              if (curDue <= 0.001) {
+                const err = new Error('Invoice has already been fully paid (Balance Due is $0.00)')
+                err.statusCode = 400
+                throw err
+              }
+
+              if (payAmt > curDue + 0.001) {
+                const err = new Error(`Payment amount ($${payAmt.toFixed(2)}) exceeds invoice balance due of $${curDue.toFixed(2)}`)
+                err.statusCode = 400
+                throw err
+              }
+
+              const newDue = parseFloat(Math.max(0, curDue - payAmt).toFixed(2))
+              const totalInvAmount = parseFloat(matchedInv.amount) || 0.0
+              const newStatus = newDue === 0.0 ? 'Paid' : (newDue < totalInvAmount ? 'Partially Paid' : matchedInv.status)
+
+              await tx.invoice.update({
+                where: { id: matchedInv.id },
+                data: {
+                  due: newDue,
+                  status: newStatus
+                }
+              })
+            }
+          }
+
+          const createdPayment = await tx.payment.create({
+            data: {
+              receiptNumber,
+              clinicId: userClinicId || null,
+              clientName: finalClientName,
+              amount: payAmt,
+              paymentDate: finalDate,
+              paymentMethod: finalMethod,
+              invoiceReference: resolvedInvoiceRef,
+              status: 'Successful (Paid)',
+              transactionId: generatedTxId,
+              patientId: patientId || null
+            }
+          })
+
+          if (idempotencyKey && tx.paymentIdempotency) {
+            await tx.paymentIdempotency.create({
+              data: {
+                clinicId: userClinicId,
+                idempotencyKey,
+                requestHash: currentRequestHash,
+                paymentId: createdPayment.id
+              }
+            })
+          }
+
+          return createdPayment
+        })
+
+        break // Successfully created!
+      } catch (err) {
+        if (err.statusCode) {
+          return res.status(err.statusCode).json({
+            success: false,
+            error: err.message
+          })
+        }
+
+        if (err.code === 'P2002') {
+          const target = Array.isArray(err.meta?.target) ? err.meta.target.join(',') : String(err.meta?.target || '')
+          const isReceiptCollision = target.includes('receiptNumber') || target.includes('payments_receiptNumber_key')
+
+          if (isReceiptCollision) {
+            await new Promise(r => setTimeout(r, 15 + Math.random() * 35))
+            continue
+          }
+
+          // Idempotency key collision (concurrent duplicate request won the race)
+          if (idempotencyKey && prisma.paymentIdempotency) {
+            const raceWinner = await prisma.paymentIdempotency.findUnique({
+              where: {
+                clinic_payment_idempotency_key_idx: { clinicId: userClinicId, idempotencyKey }
+              },
+              include: { payment: true }
+            }).catch(() => null)
+
+            if (raceWinner?.payment) {
+              if (raceWinner.requestHash !== currentRequestHash) {
+                return res.status(409).json({
+                  success: false,
+                  error: 'Idempotency key was previously used with different payment parameters. Please generate a new key for a different payment.'
+                })
+              }
+              return res.status(200).json({
+                success: true,
+                data: raceWinner.payment,
+                idempotentReplay: true
+              })
+            }
+          }
+        }
+
+        throw err
+      }
+    }
+
+    if (!paymentResult) {
+      return res.status(500).json({
+        success: false,
+        error: 'Unable to process payment after maximum retry attempts. Please retry.'
+      })
+    }
+
+    res.status(200).json({ success: true, data: paymentResult })
   } catch (err) {
     next(err)
   }
@@ -2053,54 +2301,71 @@ function generatePeriodIntervals(startDate, endDate, periodStr) {
   const normPeriod = (periodStr || 'monthly').toLowerCase().trim()
   const effStartDate = startDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
   const effEndDate = endDate || new Date().toISOString().split('T')[0]
-  const sDate = new Date(effStartDate)
-  const eDate = new Date(effEndDate)
+
+  const [sYear, sMonth, sDay] = effStartDate.split('-').map(Number)
+  const [eYear, eMonth, eDay] = effEndDate.split('-').map(Number)
+  const sUtc = new Date(Date.UTC(sYear, sMonth - 1, sDay))
+  const eUtc = new Date(Date.UTC(eYear, eMonth - 1, eDay))
+
+  if (sUtc > eUtc) {
+    throw new RangeError('Invalid date range: startDate cannot be after endDate.')
+  }
 
   const intervals = []
 
   if (normPeriod === 'daily') {
-    let curr = new Date(sDate)
-    while (curr <= eDate) {
+    const MAX_DAILY_INTERVALS = 730
+    const totalDays = Math.round((eUtc - sUtc) / 86400000) + 1
+    if (totalDays > MAX_DAILY_INTERVALS) {
+      throw new RangeError(`Daily reports support a maximum date range of ${MAX_DAILY_INTERVALS} days (2 years). Selected range is ${totalDays} days. Please select Weekly, Monthly, or Yearly period.`)
+    }
+
+    let curr = new Date(sUtc)
+    while (curr <= eUtc) {
       const currIso = curr.toISOString().split('T')[0]
       const nextDay = new Date(curr)
-      nextDay.setDate(nextDay.getDate() + 1)
+      nextDay.setUTCDate(nextDay.getUTCDate() + 1)
       const nextIso = nextDay.toISOString().split('T')[0]
-      const label = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
-      const chartLabel = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
+      const label = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
+      const chartLabel = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', timeZone: 'UTC' })
 
       intervals.push({ label, chartLabel, startIso: currIso, endIso: nextIso })
       curr = nextDay
-      if (intervals.length >= 90) break
     }
   } else if (normPeriod === 'weekly') {
-    let curr = new Date(sDate)
-    while (curr <= eDate) {
+    const MAX_WEEKLY_INTERVALS = 156 // 3 years (156 weeks)
+    const totalWeeks = Math.ceil((Math.round((eUtc - sUtc) / 86400000) + 1) / 7)
+    if (totalWeeks > MAX_WEEKLY_INTERVALS) {
+      throw new RangeError(`Weekly reports support a maximum date range of ${MAX_WEEKLY_INTERVALS} weeks. Selected range is ${totalWeeks} weeks. Please select Monthly or Yearly period.`)
+    }
+
+    let curr = new Date(sUtc)
+    while (curr <= eUtc) {
       const currIso = curr.toISOString().split('T')[0]
       const nextWeek = new Date(curr)
-      nextWeek.setDate(nextWeek.getDate() + 7)
+      nextWeek.setUTCDate(nextWeek.getUTCDate() + 7)
       const nextIso = nextWeek.toISOString().split('T')[0]
 
       const weekEndDisplay = new Date(nextWeek)
-      weekEndDisplay.setDate(weekEndDisplay.getDate() - 1)
-      const effectiveEnd = weekEndDisplay > eDate ? eDate : weekEndDisplay
+      weekEndDisplay.setUTCDate(weekEndDisplay.getUTCDate() - 1)
+      const effectiveEnd = weekEndDisplay > eUtc ? eUtc : weekEndDisplay
 
-      const sStr = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })
-      const eStr = effectiveEnd.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
+      const sStr = curr.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', timeZone: 'UTC' })
+      const eStr = effectiveEnd.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
       const label = currIso === effectiveEnd.toISOString().split('T')[0] ? sStr : `${sStr} – ${eStr}`
-      const chartLabel = currIso === effectiveEnd.toISOString().split('T')[0] ? sStr : `${sStr} – ${effectiveEnd.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' })}`
+      const chartLabel = currIso === effectiveEnd.toISOString().split('T')[0] ? sStr : `${sStr} – ${effectiveEnd.toLocaleDateString('en-AU', { day: 'numeric', month: 'short', timeZone: 'UTC' })}`
 
       intervals.push({ label, chartLabel, startIso: currIso, endIso: nextIso })
       curr = nextWeek
-      if (intervals.length >= 52) break
     }
   } else if (normPeriod === 'yearly') {
-    const startYear = sDate.getFullYear()
-    const endYear = eDate.getFullYear()
+    const startYear = sUtc.getUTCFullYear()
+    const endYear = eUtc.getUTCFullYear()
     for (let yr = startYear; yr <= endYear; yr++) {
       const yearStart = `${yr}-01-01`
       const nextYearStart = `${yr + 1}-01-01`
       const effectiveStartIso = (yr === startYear && effStartDate) ? effStartDate : yearStart
-      const effectiveEndIso = (yr === endYear && effEndDate) ? new Date(new Date(effEndDate).getTime() + 86400000).toISOString().split('T')[0] : nextYearStart
+      const effectiveEndIso = (yr === endYear && effEndDate) ? new Date(Date.UTC(eYear, eMonth - 1, eDay + 1)).toISOString().split('T')[0] : nextYearStart
 
       intervals.push({
         label: String(yr),
@@ -2111,26 +2376,26 @@ function generatePeriodIntervals(startDate, endDate, periodStr) {
     }
   } else {
     // Default: 'monthly'
-    let currYear = sDate.getFullYear()
-    let currMonth = sDate.getMonth()
-    const endYear = eDate.getFullYear()
-    const endMonth = eDate.getMonth()
+    let currYear = sUtc.getUTCFullYear()
+    let currMonth = sUtc.getUTCMonth()
+    const endYear = eUtc.getUTCFullYear()
+    const endMonth = eUtc.getUTCMonth()
 
     while (currYear < endYear || (currYear === endYear && currMonth <= endMonth)) {
-      const mDate = new Date(currYear, currMonth, 1)
-      const nextMDate = new Date(currYear, currMonth + 1, 1)
+      const mDate = new Date(Date.UTC(currYear, currMonth, 1))
+      const nextMDate = new Date(Date.UTC(currYear, currMonth + 1, 1))
       const mStartIso = `${currYear}-${String(currMonth + 1).padStart(2, '0')}-01`
-      const nextMStartIso = `${nextMDate.getFullYear()}-${String(nextMDate.getMonth() + 1).padStart(2, '0')}-01`
+      const nextMStartIso = `${nextMDate.getUTCFullYear()}-${String(nextMDate.getUTCMonth() + 1).padStart(2, '0')}-01`
 
-      const effectiveStartIso = (currYear === sDate.getFullYear() && currMonth === sDate.getMonth() && effStartDate)
+      const effectiveStartIso = (currYear === sUtc.getUTCFullYear() && currMonth === sUtc.getUTCMonth() && effStartDate)
         ? effStartDate
         : mStartIso
       const effectiveEndIso = (currYear === endYear && currMonth === endMonth && effEndDate)
-        ? new Date(new Date(effEndDate).getTime() + 86400000).toISOString().split('T')[0]
+        ? new Date(Date.UTC(eYear, eMonth - 1, eDay + 1)).toISOString().split('T')[0]
         : nextMStartIso
 
-      const label = mDate.toLocaleDateString('en-AU', { month: 'short', year: 'numeric' })
-      const chartLabel = mDate.toLocaleDateString('en-AU', { month: 'short' })
+      const label = mDate.toLocaleDateString('en-AU', { month: 'short', year: 'numeric', timeZone: 'UTC' })
+      const chartLabel = mDate.toLocaleDateString('en-AU', { month: 'short', timeZone: 'UTC' })
 
       intervals.push({
         label,
@@ -2144,7 +2409,7 @@ function generatePeriodIntervals(startDate, endDate, periodStr) {
         currMonth = 0
         currYear++
       }
-      if (intervals.length >= 60) break
+      if (intervals.length >= 120) break
     }
   }
 
@@ -2153,19 +2418,53 @@ function generatePeriodIntervals(startDate, endDate, periodStr) {
       label: `${effStartDate} – ${effEndDate}`,
       chartLabel: `${effStartDate} – ${effEndDate}`,
       startIso: effStartDate,
-      endIso: new Date(new Date(effEndDate).getTime() + 86400000).toISOString().split('T')[0]
+      endIso: new Date(Date.UTC(eYear, eMonth - 1, eDay + 1)).toISOString().split('T')[0]
     })
   }
 
   return intervals
 }
 
-// Reports & Analytics Management
+const MONTH_MAP = {
+  jan: '01', january: '01',
+  feb: '02', february: '02',
+  mar: '03', march: '03',
+  apr: '04', april: '04',
+  may: '05',
+  jun: '06', june: '06',
+  jul: '07', july: '07',
+  aug: '08', august: '08',
+  sep: '09', sept: '09', september: '09',
+  oct: '10', october: '10',
+  nov: '11', november: '11',
+  dec: '12', december: '12'
+}
+
+// Reports & Analytics Management - UTC-safe calendar date normalizer
 const normalizeToIsoDate = (dateVal) => {
   if (!dateVal) return null
   if (typeof dateVal === 'string') {
     const trimmed = dateVal.trim()
+    if (!trimmed) return null
+    // Fast path 1: YYYY-MM-DD
     if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed
+    // Fast path 2: DD Mon YYYY / DD Month YYYY (e.g. '21 Sep 2026', '16 Oct 2026')
+    const dmyMatch = trimmed.match(/^(\d{1,2})[-\s/]+([A-Za-z]+)[-\s/]+(\d{4})$/)
+    if (dmyMatch) {
+      const day = String(dmyMatch[1]).padStart(2, '0')
+      const monthKey = dmyMatch[2].toLowerCase()
+      const month = MONTH_MAP[monthKey]
+      const year = dmyMatch[3]
+      if (month) return `${year}-${month}-${day}`
+    }
+    // Fast path 3: DD/MM/YYYY or DD-MM-YYYY
+    const dmyNumMatch = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/)
+    if (dmyNumMatch) {
+      const day = String(dmyNumMatch[1]).padStart(2, '0')
+      const month = String(dmyNumMatch[2]).padStart(2, '0')
+      const year = dmyNumMatch[3]
+      return `${year}-${month}-${day}`
+    }
   }
   const d = new Date(dateVal)
   if (isNaN(d.getTime())) return null
@@ -2293,7 +2592,15 @@ const getReports = async (req, res, next) => {
     let dynamicTable = null
 
     // Generate dynamic intervals for the selected period (Daily, Weekly, Monthly, Yearly)
-    const intervals = generatePeriodIntervals(startDate, endDate, period)
+    let intervals
+    try {
+      intervals = generatePeriodIntervals(startDate, endDate, period)
+    } catch (err) {
+      if (err instanceof RangeError) {
+        return res.status(400).json({ success: false, message: err.message })
+      }
+      throw err
+    }
 
     switch (reportType) {
       case 'invoices_ledger':
@@ -2583,8 +2890,8 @@ const getReports = async (req, res, next) => {
     const bookedHours = filteredAppointments.reduce((acc, a) => acc + ((parseFloat(a.duration) || 60) / 60), 0)
     const calculatedUtilisation = availableWorkingHours > 0
       ? Math.min(100, Math.max(0, Math.round((bookedHours / availableWorkingHours) * 100)))
-      : 78
-    const utilisationRate = calculatedUtilisation > 0 ? calculatedUtilisation : 78
+      : 0
+    const utilisationRate = calculatedUtilisation
 
     res.json({
       success: true,
@@ -4709,7 +5016,10 @@ module.exports = {
   createCommunication,
   deleteCommunication,
   sendPortalInvite,
-  clearSampleTestData
+  clearSampleTestData,
+  generatePeriodIntervals,
+  normalizeToIsoDate,
+  computeCanonicalPaymentHash
 }
 
 

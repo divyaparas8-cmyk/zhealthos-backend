@@ -128,6 +128,39 @@ async function runPeriodTests() {
   // 4. Yearly: 1 table row
   assert.strictEqual(results['Yearly'].tableData.rows.length, 1, 'Yearly all_summary must produce 1 table row')
 
+  // Dynamically calculate expected period-filtered outstanding balance for [startDate, endDate]
+  // Invoices issued within this window that have a remaining unpaid balance
+  const prisma = require('../config/db')
+  const allInvoices = await prisma.invoice.findMany()
+  const isInvoiceSettled = (i) => {
+    const s = (i.status || '').toLowerCase()
+    return s === 'paid' || s === 'completed' || (Number(i.due) === 0 && (Number(i.amount) || 0) > 0)
+  }
+  const isInvoiceCancelled = (i) => {
+    const s = (i.status || '').toLowerCase()
+    return s === 'cancelled' || s === 'cancel'
+  }
+  const getInvoiceDue = (i) => {
+    if (isInvoiceSettled(i) || isInvoiceCancelled(i) || (i.status || '').toLowerCase() === 'draft') return 0
+    if (i.due !== undefined && i.due !== null) return Math.max(0, parseFloat(i.due) || 0)
+    return Math.max(0, parseFloat(i.amount) || 0)
+  }
+
+  const expectedPeriodOutstanding = allInvoices
+    .filter(i => {
+      const d = (i.issueDate ? new Date(i.issueDate).toISOString().split('T')[0] : '') ||
+                (i.createdAt ? new Date(i.createdAt).toISOString().split('T')[0] : '')
+      return d && d >= startDate && d <= endDate
+    })
+    .filter(i => getInvoiceDue(i) > 0)
+    .reduce((sum, i) => sum + getInvoiceDue(i), 0)
+
+  // Verify that all-time KPI Outstanding includes all active invoices and is separate from period-filtered balance
+  assert.ok(
+    baseOutstanding >= expectedPeriodOutstanding,
+    `All-time Outstanding KPI ($${baseOutstanding}) must encompass period-filtered balance ($${expectedPeriodOutstanding})`
+  )
+
   // Reconcile table row revenue and outstanding sums
   for (const p of periods) {
     const rows = results[p].tableData.rows
@@ -147,8 +180,8 @@ async function runPeriodTests() {
     )
     assert.strictEqual(
       Math.round(tableOutSum),
-      1474,
-      `Sum of table row outstanding for ${p} ($${tableOutSum}) must equal period unpaid invoices ($1474)`
+      Math.round(expectedPeriodOutstanding),
+      `Sum of table row outstanding for ${p} ($${tableOutSum}) must equal period unpaid invoices ($${expectedPeriodOutstanding})`
     )
     console.log(`✓ ${p} Detailed Report rows: ${rows.length}, row rev sum: $${tableRevSum.toFixed(2)}, row out sum: $${tableOutSum.toFixed(2)}`)
   }

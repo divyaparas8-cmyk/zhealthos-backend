@@ -303,7 +303,24 @@ model Payment {
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
+  idempotencyRecord PaymentIdempotency?
+
   @@map("payments")
+}
+
+model PaymentIdempotency {
+  id             String   @id @default(uuid())
+  clinicId       String
+  idempotencyKey String
+  requestHash    String
+  paymentId      String   @unique
+  createdAt      DateTime @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@unique([clinicId, idempotencyKey], name: "clinic_payment_idempotency_key_idx")
+  @@index([clinicId])
+  @@map("payment_idempotency")
 }
 
 model Product {

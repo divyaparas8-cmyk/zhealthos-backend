@@ -1,4 +1,5 @@
 const prisma = require('../../config/db')
+const crypto = require('crypto')
 
 const getClinicIdFromReq = async (req) => {
   if (!req?.user) return null
@@ -673,9 +674,29 @@ const getPayments = async (req, res, next) => {
   }
 }
 
+// Canonical semantic hash for payment creation idempotency
+const computeCanonicalPaymentHash = (data, clinicId) => {
+  const normalized = {
+    clinicId: String(clinicId || '').trim(),
+    clientName: (data.clientName || data.from || '').trim().toLowerCase(),
+    patientId: data.patientId ? String(data.patientId).trim() : null,
+    amount: Number(parseFloat(data.amount) || 0).toFixed(2),
+    paymentDate: String(data.paymentDate || data.date || '').trim(),
+    paymentMethod: (data.paymentMethod || 'Stripe / Credit Card').trim().toLowerCase(),
+    invoiceReference: (data.invoiceReference || '').trim().toUpperCase()
+  }
+
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify(normalized))
+    .digest('hex')
+}
+
 const createPayment = async (req, res, next) => {
   try {
-    const { from, clientName, amount, date, paymentDate, paymentMethod, invoiceReference, patientId, practitionerId } = req.body
+    const { from, clientName, amount, date, paymentDate, paymentMethod, invoiceReference, patientId, practitionerId, transactionReference } = req.body || {}
+
+    const idempotencyKey = req.headers?.['x-idempotency-key'] || req.body?.idempotencyKey || null
 
     let clinicId = req.user?.clinicId
     let finalPracId = practitionerId || null
@@ -689,28 +710,210 @@ const createPayment = async (req, res, next) => {
       }
     }
 
-    const randNum = Math.floor(1000 + Math.random() * 9000)
-    const receiptNumber = `RCPT-${Date.now().toString().slice(-4)}${randNum}`
+    if (idempotencyKey && !clinicId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Tenant context required for idempotent payment creation'
+      })
+    }
+
+    const payAmt = parseFloat(amount)
+    if (isNaN(payAmt) || payAmt <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Payment amount must be greater than 0'
+      })
+    }
+
     const finalClientName = from || clientName || 'Client'
     const finalDate = paymentDate || date || new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+    const finalMethod = paymentMethod || 'Stripe / Credit Card'
+    const finalInvoiceRef = invoiceReference ? String(invoiceReference).trim() : null
 
-    const payment = await prisma.payment.create({
-      data: {
-        clinicId: clinicId || null,
-        practitionerId: finalPracId || null,
-        receiptNumber,
-        clientName: finalClientName,
-        amount: parseFloat(amount) || 0.0,
-        paymentDate: finalDate,
-        paymentMethod: paymentMethod || 'Stripe / Credit Card',
-        invoiceReference: invoiceReference || `INV-${receiptNumber.replace('RCPT-', '')}`,
-        status: 'Successful (Paid)',
-        transactionId: `tx_${receiptNumber.toLowerCase()}_892`,
-        patientId: patientId || null
+    const payloadForHash = {
+      from,
+      clientName: finalClientName,
+      patientId: patientId || null,
+      amount: payAmt,
+      date: finalDate,
+      paymentDate: finalDate,
+      paymentMethod: finalMethod,
+      invoiceReference: finalInvoiceRef
+    }
+
+    const currentRequestHash = computeCanonicalPaymentHash(payloadForHash, clinicId)
+
+    // Pre-flight idempotency check
+    if (idempotencyKey && prisma.paymentIdempotency) {
+      try {
+        const existingRecord = await prisma.paymentIdempotency.findUnique({
+          where: {
+            clinic_payment_idempotency_key_idx: { clinicId, idempotencyKey }
+          },
+          include: { payment: true }
+        })
+
+        if (existingRecord?.payment) {
+          if (existingRecord.requestHash !== currentRequestHash) {
+            return res.status(409).json({
+              success: false,
+              error: 'Idempotency key was previously used with different payment parameters. Please generate a new key for a different payment.'
+            })
+          }
+          return res.status(200).json({
+            success: true,
+            data: existingRecord.payment,
+            idempotentReplay: true
+          })
+        }
+      } catch (checkErr) {
+        console.warn('Payment idempotency pre-check notice:', checkErr.message)
       }
-    })
+    }
 
-    res.json({ success: true, data: payment })
+    let attempts = 0
+    const maxAttempts = 5
+    let paymentResult = null
+
+    while (attempts < maxAttempts) {
+      attempts++
+
+      const randNum = Math.floor(1000 + Math.random() * 9000)
+      const receiptNumber = `RCPT-${Date.now().toString().slice(-4)}${randNum}`
+      const generatedTxId = transactionReference || `tx_${receiptNumber.toLowerCase()}_892`
+      const resolvedInvoiceRef = finalInvoiceRef || `INV-${receiptNumber.replace('RCPT-', '')}`
+
+      try {
+        paymentResult = await prisma.$transaction(async (tx) => {
+          if (finalInvoiceRef) {
+            // Pessimistic row locking on target invoice to prevent concurrent overpayment race conditions
+            const lockedInvs = await tx.$queryRawUnsafe(
+              'SELECT id, clinicId, amount, due, status FROM invoices WHERE id = ? OR displayId = ? OR invoiceNumber = ? LIMIT 1 FOR UPDATE',
+              finalInvoiceRef, finalInvoiceRef, finalInvoiceRef
+            )
+            const matchedInv = lockedInvs && lockedInvs.length > 0 ? lockedInvs[0] : null
+
+            if (matchedInv) {
+              if (matchedInv.clinicId && clinicId && matchedInv.clinicId !== clinicId) {
+                const err = new Error('Invoice does not belong to the active clinic tenant')
+                err.statusCode = 403
+                throw err
+              }
+
+              const curDue = matchedInv.due !== undefined && matchedInv.due !== null
+                ? parseFloat(matchedInv.due)
+                : (parseFloat(matchedInv.amount) || 0.0)
+
+              if (curDue <= 0.001) {
+                const err = new Error('Invoice has already been fully paid (Balance Due is $0.00)')
+                err.statusCode = 400
+                throw err
+              }
+
+              if (payAmt > curDue + 0.001) {
+                const err = new Error(`Payment amount ($${payAmt.toFixed(2)}) exceeds invoice balance due of $${curDue.toFixed(2)}`)
+                err.statusCode = 400
+                throw err
+              }
+
+              const newDue = parseFloat(Math.max(0, curDue - payAmt).toFixed(2))
+              const totalInvAmount = parseFloat(matchedInv.amount) || 0.0
+              const newStatus = newDue === 0.0 ? 'Paid' : (newDue < totalInvAmount ? 'Partially Paid' : matchedInv.status)
+
+              await tx.invoice.update({
+                where: { id: matchedInv.id },
+                data: {
+                  due: newDue,
+                  status: newStatus
+                }
+              })
+            }
+          }
+
+          const createdPayment = await tx.payment.create({
+            data: {
+              receiptNumber,
+              clinicId: clinicId || null,
+              practitionerId: finalPracId || null,
+              clientName: finalClientName,
+              amount: payAmt,
+              paymentDate: finalDate,
+              paymentMethod: finalMethod,
+              invoiceReference: resolvedInvoiceRef,
+              status: 'Successful (Paid)',
+              transactionId: generatedTxId,
+              patientId: patientId || null
+            }
+          })
+
+          if (idempotencyKey && tx.paymentIdempotency) {
+            await tx.paymentIdempotency.create({
+              data: {
+                clinicId,
+                idempotencyKey,
+                requestHash: currentRequestHash,
+                paymentId: createdPayment.id
+              }
+            })
+          }
+
+          return createdPayment
+        })
+
+        break
+      } catch (err) {
+        if (err.statusCode) {
+          return res.status(err.statusCode).json({
+            success: false,
+            error: err.message
+          })
+        }
+
+        if (err.code === 'P2002') {
+          const target = Array.isArray(err.meta?.target) ? err.meta.target.join(',') : String(err.meta?.target || '')
+          const isReceiptCollision = target.includes('receiptNumber') || target.includes('payments_receiptNumber_key')
+
+          if (isReceiptCollision) {
+            await new Promise(r => setTimeout(r, 15 + Math.random() * 35))
+            continue
+          }
+
+          if (idempotencyKey && prisma.paymentIdempotency) {
+            const raceWinner = await prisma.paymentIdempotency.findUnique({
+              where: {
+                clinic_payment_idempotency_key_idx: { clinicId, idempotencyKey }
+              },
+              include: { payment: true }
+            }).catch(() => null)
+
+            if (raceWinner?.payment) {
+              if (raceWinner.requestHash !== currentRequestHash) {
+                return res.status(409).json({
+                  success: false,
+                  error: 'Idempotency key was previously used with different payment parameters. Please generate a new key for a different payment.'
+                })
+              }
+              return res.status(200).json({
+                success: true,
+                data: raceWinner.payment,
+                idempotentReplay: true
+              })
+            }
+          }
+        }
+
+        throw err
+      }
+    }
+
+    if (!paymentResult) {
+      return res.status(500).json({
+        success: false,
+        error: 'Unable to process payment after maximum retry attempts. Please retry.'
+      })
+    }
+
+    res.status(200).json({ success: true, data: paymentResult })
   } catch (err) {
     next(err)
   }
