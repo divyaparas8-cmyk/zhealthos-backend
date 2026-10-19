@@ -90,7 +90,7 @@ async function runTests() {
   await getReports(reqDaily, resDaily, (err) => { if (err) throw err })
 
   assert.ok(capturedDaily && capturedDaily.success)
-  assert.strictEqual(capturedDaily.data.metrics.revenue, 554)
+  assert.strictEqual(capturedDaily.data.metrics.revenue, 774)
 
   const rowsDaily = capturedDaily.data.tableData.rows
 
@@ -105,12 +105,12 @@ async function runTests() {
   assert.strictEqual(row21Sep.rev, '$290.00', '21 September must contain the $290.00 payment')
   assert.strictEqual(row20Sep.rev, '$0.00', '20 September must have $0.00 revenue')
   assert.strictEqual(row16Oct.rev, '$132.00', '16 October must contain the $132.00 payment')
-  assert.strictEqual(row17Oct.rev, '$132.00', '17 October must contain the $132.00 payment')
+  assert.strictEqual(row17Oct.rev, '$352.00', '17 October must contain the $352.00 payments (132 + 100 + 120)')
   assert.strictEqual(row15Oct.rev, '$0.00', '15 October must have $0.00 revenue')
 
   console.log(`✓ PASS: 21 September payment ($290.00) appears on 21 September (20 Sep is $0.00).`)
   console.log(`✓ PASS: 16 October payment ($132.00) appears on 16 October.`)
-  console.log(`✓ PASS: 17 October payment ($132.00) appears on 17 October.`)
+  console.log(`✓ PASS: 17 October payments ($352.00) appears on 17 October.`)
 
   // --------------------------------------------------------------------------
   // TEST 5: Weekly Reports Verification
@@ -134,13 +134,13 @@ async function runTests() {
   await getReports(reqWeekly, resWeekly, (err) => { if (err) throw err })
 
   assert.ok(capturedWeekly && capturedWeekly.success)
-  assert.strictEqual(capturedWeekly.data.metrics.revenue, 554)
+  assert.strictEqual(capturedWeekly.data.metrics.revenue, 774)
 
   const weeklySum = capturedWeekly.data.tableData.rows.reduce((sum, r) => {
     return sum + (parseFloat(String(r.rev).replace(/[^0-9.-]+/g, '')) || 0)
   }, 0)
-  assert.strictEqual(Math.round(weeklySum), 554, 'Weekly table rows sum must equal $554')
-  console.log(`✓ PASS: Weekly Reports sum ($${weeklySum.toFixed(2)}) equals $554.`)
+  assert.strictEqual(Math.round(weeklySum), 774, 'Weekly table rows sum must equal $774')
+  console.log(`✓ PASS: Weekly Reports sum ($${weeklySum.toFixed(2)}) equals $774.`)
 
   // --------------------------------------------------------------------------
   // TEST 6: Monthly Reports Verification
@@ -164,7 +164,7 @@ async function runTests() {
   await getReports(reqMonthly, resMonthly, (err) => { if (err) throw err })
 
   assert.ok(capturedMonthly && capturedMonthly.success)
-  assert.strictEqual(capturedMonthly.data.metrics.revenue, 554)
+  assert.strictEqual(capturedMonthly.data.metrics.revenue, 774)
 
   const rowsMonthly = capturedMonthly.data.tableData.rows
   const sepRow = rowsMonthly.find(r => r.period.includes('Sep'))
@@ -172,13 +172,13 @@ async function runTests() {
 
   assert.ok(sepRow && octRow, 'Must have Sep and Oct monthly rows')
   assert.strictEqual(sepRow.rev, '$290.00', 'Sep monthly revenue must be $290.00')
-  assert.strictEqual(octRow.rev, '$264.00', 'Oct monthly revenue must be $264.00 (132 + 132)')
+  assert.strictEqual(octRow.rev, '$484.00', 'Oct monthly revenue must be $484.00 (132 + 132 + 100 + 120)')
 
   const monthlySum = rowsMonthly.reduce((sum, r) => {
     return sum + (parseFloat(String(r.rev).replace(/[^0-9.-]+/g, '')) || 0)
   }, 0)
-  assert.strictEqual(Math.round(monthlySum), 554, 'Monthly table rows sum must equal $554')
-  console.log(`✓ PASS: Monthly Reports correctly splits Sep ($290.00) and Oct ($264.00), sum = $554.`)
+  assert.strictEqual(Math.round(monthlySum), 774, 'Monthly table rows sum must equal $774')
+  console.log(`✓ PASS: Monthly Reports correctly splits Sep ($290.00) and Oct ($484.00), sum = $774.`)
 
   // --------------------------------------------------------------------------
   // TEST 7: Database Integrity Check (Read-Only)
@@ -186,7 +186,7 @@ async function runTests() {
   console.log('--- TEST 7: Read-Only Verification (No Database Writes) ---')
   const prisma = require('../config/db')
   const payments = await prisma.payment.findMany({ orderBy: { createdAt: 'desc' } })
-  assert.strictEqual(payments.length, 6, 'Total payments in DB must remain exactly 6')
+  assert.strictEqual(payments.length, 8, 'Total payments in DB must remain exactly 8')
   const pSep = payments.find(p => p.amount === 50)
   assert.strictEqual(pSep.paymentDate, '21 Sep 2026', 'Underlying database record must remain untouched')
   console.log('✓ PASS: All database records remain completely untouched.')

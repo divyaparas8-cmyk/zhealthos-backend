@@ -2531,11 +2531,42 @@ const getReports = async (req, res, next) => {
         return payDate >= startDate && payDate <= endDate
       })
     }
+    if (practitioner && practitioner !== 'All Practitioners' && practitioner !== 'All') {
+      const pracLower = practitioner.toLowerCase()
+      const matchingInvoiceKeys = new Set(
+        invoices
+          .filter(i => (i.practitionerName || '').toLowerCase().includes(pracLower))
+          .flatMap(i => [i.id, i.displayId, i.invoiceNumber].filter(Boolean))
+      )
+      const matchingPractitionerIds = new Set(
+        practitioners
+          .filter(pr => (pr.name || '').toLowerCase().includes(pracLower))
+          .map(pr => pr.id)
+          .filter(Boolean)
+      )
+      filteredPayments = filteredPayments.filter(p => {
+        if (p.practitionerId && matchingPractitionerIds.has(p.practitionerId)) return true
+        if (p.invoiceReference && matchingInvoiceKeys.has(p.invoiceReference)) return true
+        return false
+      })
+    }
 
-    // Calculate Dynamic Metrics from DB
-    const totalPayments = filteredPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
-    const totalInvoicePaid = filteredInvoices.filter(i => (i.status || '').toLowerCase() === 'paid').reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
-    const revenue = totalPayments > 0 ? totalPayments : totalInvoicePaid
+    // Calculate Dynamic Financial Metrics strictly from DB
+    // TASK 1: Cash Collected is strictly the sum of actual payment receipts in selected range and clinic scope.
+    // Zero valid receipts in the period displays $0.00 cash collected, regardless of Paid invoice statuses.
+    const cashCollected = parseFloat(filteredPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0).toFixed(2))
+
+    // TASK 2: Billed Amount represents issued invoices in date range & clinic scope, excluding Draft and Cancelled invoices.
+    const billedAmount = parseFloat(filteredInvoices
+      .filter(i => {
+        const s = (i.status || '').toLowerCase()
+        return s !== 'draft' && s !== 'cancelled' && s !== 'cancel'
+      })
+      .reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
+      .toFixed(2))
+
+    // Preserve existing API compatibility (revenue equals cashCollected)
+    const revenue = cashCollected
 
     const totalApptsCount = filteredAppointments.length
     const cancelledCount = filteredAppointments.filter(a => (a.status || '').toLowerCase().includes('cancel')).length
@@ -2754,8 +2785,9 @@ const getReports = async (req, res, next) => {
         dynamicTable = {
           headers: ['Metric Name', 'Current Value', 'Status'],
           rows: [
-            { metric: 'Total Revenue', current: `$${revenue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, status: 'Active' },
-            { metric: 'Outstanding Balance', current: `$${outstanding.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, status: 'Active' },
+            { metric: 'Cash Collected', current: `$${cashCollected.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, status: 'Active' },
+            { metric: 'Billed Amount', current: `$${billedAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, status: 'Active' },
+            { metric: 'Outstanding Receivables', current: `$${outstanding.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`, status: 'Active' },
             { metric: 'New Client Registrations', current: newClientsCount, status: 'Active' },
             { metric: 'Total Appointments Count', current: totalApptsCount, status: 'Active' },
             { metric: 'Appointment Cancellation Rate', current: `${cancellationRate}%`, status: 'Active' }
@@ -2770,18 +2802,19 @@ const getReports = async (req, res, next) => {
             const d = normalizeToIsoDate(p.paymentDate) || normalizeToIsoDate(p.createdAt)
             return d && d >= int.startIso && d < int.endIso
           })
-          const intPaidInvoices = filteredInvoices.filter(i => {
-            const d = normalizeToIsoDate(i.issueDate) || normalizeToIsoDate(i.createdAt)
-            return (i.status || '').toLowerCase() === 'paid' && d && d >= int.startIso && d < int.endIso
-          })
-          const intRev = filteredPayments.length > 0
-            ? intPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
-            : intPaidInvoices.reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
+          const intCash = intPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
 
           const intInvoices = filteredInvoices.filter(i => {
             const d = normalizeToIsoDate(i.issueDate) || normalizeToIsoDate(i.createdAt)
             return d && d >= int.startIso && d < int.endIso
           })
+          const intBilled = intInvoices
+            .filter(i => {
+              const s = (i.status || '').toLowerCase()
+              return s !== 'draft' && s !== 'cancelled' && s !== 'cancel'
+            })
+            .reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
+
           const intOut = intInvoices
             .filter(i => getInvoiceDue(i) > 0)
             .reduce((acc, i) => acc + getInvoiceDue(i), 0)
@@ -2801,13 +2834,14 @@ const getReports = async (req, res, next) => {
             period: int.label,
             appts: intAppts,
             clients: intClients,
-            rev: `$${intRev.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+            rev: `$${intCash.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+            billed: `$${intBilled.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
             out: `$${intOut.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
           }
         })
 
         dynamicTable = {
-          headers: ['Period', 'Appointments Completed', 'New Clients', 'Total Revenue ($)', 'Outstanding Balance ($)'],
+          headers: ['Period', 'Appointments Completed', 'New Clients', 'Cash Collected ($)', 'Billed Amount ($)', 'Outstanding Balance ($)'],
           rows: summaryRows
         }
         break
@@ -2822,13 +2856,15 @@ const getReports = async (req, res, next) => {
     const revenueByMonth = {}
     MONTHS.forEach(m => { revenueByMonth[m] = { name: m, current: 0, previous: 0 } })
 
-    // Use payments for revenue (most accurate), fallback to paid invoices if no payments
-    const revenueSource = payments.length > 0 ? payments : invoices.filter(i => (i.status || '').toLowerCase() === 'paid')
-    revenueSource.forEach(p => {
-      const d = new Date(p.createdAt || p.paymentDate)
-      if (isNaN(d.getTime())) return
-      const mon = MONTHS[d.getMonth()]
-      const yr = d.getFullYear()
+    // Strictly actual recorded payments for cash revenue
+    payments.forEach(p => {
+      const payIso = normalizeToIsoDate(p.paymentDate) || normalizeToIsoDate(p.createdAt)
+      if (!payIso) return
+      const [yStr, mStr] = payIso.split('-')
+      const yr = parseInt(yStr, 10)
+      const mIdx = parseInt(mStr, 10) - 1
+      if (mIdx < 0 || mIdx > 11) return
+      const mon = MONTHS[mIdx]
       const amt = parseFloat(p.amount) || 0
       if (yr === currentYear) revenueByMonth[mon].current += amt
       else if (yr === lastYear) revenueByMonth[mon].previous += amt
@@ -2846,13 +2882,7 @@ const getReports = async (req, res, next) => {
         const d = normalizeToIsoDate(p.paymentDate) || normalizeToIsoDate(p.createdAt)
         return d && d >= int.startIso && d < int.endIso
       })
-      const intPaidInvoices = filteredInvoices.filter(i => {
-        const d = normalizeToIsoDate(i.issueDate) || normalizeToIsoDate(i.createdAt)
-        return (i.status || '').toLowerCase() === 'paid' && d && d >= int.startIso && d < int.endIso
-      })
-      const amt = filteredPayments.length > 0
-        ? intPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
-        : intPaidInvoices.reduce((acc, i) => acc + (parseFloat(i.amount) || 0), 0)
+      const amt = intPayments.reduce((acc, p) => acc + (parseFloat(p.amount) || 0), 0)
 
       return {
         name: int.chartLabel || int.label,
@@ -2902,6 +2932,8 @@ const getReports = async (req, res, next) => {
           bookedHours: parseFloat(bookedHours.toFixed(1)),
           availableWorkingHours,
           revenue,
+          cashCollected,
+          billedAmount,
           appointments: totalApptsCount,
           cancellation: cancellationRate,
           newClients: newClientsCount,
